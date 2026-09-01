@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import ccxt
 import pytest
@@ -43,6 +43,64 @@ def test_additional_exchange_init_gate_cross_account(
         "GET",
         {"settle": "usdt"},
     )
+
+
+def test_gate_loads_and_caches_full_market_leverage_tiers(default_conf, mocker, markets, tmp_path):
+    pair = "ETH/USDT:USDT"
+    default_conf["datadir"] = tmp_path
+    default_conf["trading_mode"] = "futures"
+    default_conf["margin_mode"] = "isolated"
+    default_conf["stake_currency"] = "USDT"
+    api_mock = MagicMock()
+    type(api_mock).has = PropertyMock(
+        return_value={
+            "fetchLeverageTiers": True,
+            "fetchMarketLeverageTiers": True,
+        }
+    )
+    max_leverages = [25, 20, 16, 12, 10, 6, 5, 3, 2, 1.5]
+    market_tiers = [
+        {
+            "tier": tier,
+            "minNotional": (tier - 1) * 5000,
+            "maxNotional": tier * 5000,
+            "maintenanceMarginRate": 0.02,
+            "maxLeverage": max_leverage,
+            "info": {},
+        }
+        for tier, max_leverage in enumerate(max_leverages, start=1)
+    ]
+    api_mock.fetch_leverage_tiers.return_value = {pair: market_tiers[:2]}
+    api_mock.fetch_market_leverage_tiers = AsyncMock(return_value=market_tiers)
+
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={pair: markets[pair]},
+    )
+
+    api_mock.fetch_leverage_tiers.assert_not_called()
+    api_mock.fetch_market_leverage_tiers.assert_awaited_once_with(pair)
+    assert len(exchange._leverage_tiers[pair]) == 10
+    assert exchange._leverage_tiers[pair][9]["maxLeverage"] == 1.5
+    assert (tmp_path / "futures" / "leverage_tiers_USDT.json").is_file()
+
+    api_mock.fetch_leverage_tiers.reset_mock()
+    api_mock.fetch_market_leverage_tiers.reset_mock()
+    cached_exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={pair: markets[pair]},
+    )
+
+    api_mock.fetch_leverage_tiers.assert_not_called()
+    api_mock.fetch_market_leverage_tiers.assert_not_awaited()
+    assert len(cached_exchange._leverage_tiers[pair]) == 10
+    assert cached_exchange._leverage_tiers[pair][9]["maxLeverage"] == 1.5
 
 
 @pytest.mark.parametrize(

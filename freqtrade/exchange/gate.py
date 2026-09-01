@@ -47,6 +47,7 @@ class Gate(Exchange):
         "chase_order": True,
         "cross_margin_stake_currencies": ["USDT"],
         "cross_liquidation_price_fallback": True,
+        "exchange_has_overrides": {"fetchLeverageTiers": False},
         "needs_trading_fees": True,
         "marketOrderRequiresPrice": False,
         "funding_fee_candle_limit": 90,

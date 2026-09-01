@@ -6594,6 +6594,10 @@ def test_load_leverage_tiers(mocker, default_conf, exchange_name):
     exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange=exchange_name)
     assert exchange.load_leverage_tiers() == {}
 
+    if exchange_name == "gate":
+        # Gate's futures-specific per-market loader is covered in test_gate.py.
+        return
+
     default_conf["trading_mode"] = "futures"
     default_conf["margin_mode"] = "isolated"
 
