@@ -413,6 +413,141 @@ def test_custom_stake_reserves_complete_geometric_dca_budget() -> None:
     assert stake == pytest.approx(10.0)
 
 
+def test_initial_fill_consumes_entry_signal_before_safety_order(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    order_time = datetime(2026, 1, 1, 1, 1, tzinfo=UTC)
+    trade.orders[0].order_date = order_time
+    candle = Series(
+        {
+            "date": signal_time,
+            "close": 97.9,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+    previous_candle = candle.copy()
+    previous_candle["date"] = signal_time.replace(minute=59, hour=0)
+    previous_candle["signal"] = ""
+    execution_candle = candle.copy()
+    execution_candle["date"] = order_time
+    execution_candle["signal"] = ""
+    dataframe = DataFrame([previous_candle, candle, execution_candle])
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[0],
+        current_time=order_time,
+    )
+
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+    assert (
+        strategy._safety_order_adjustment(
+            trade,
+            candle,
+            order_time,
+            min_stake=None,
+            max_stake=1000.0,
+        )
+        is None
+    )
+
+
+def test_initial_fill_does_not_consume_a_post_order_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    order_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    trade.orders[0].order_date = order_time
+    future_candle = Series(
+        {
+            "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+            "close": 97.9,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+    strategy.dp = SimpleNamespace(
+        get_analyzed_dataframe=lambda *args: (DataFrame([future_candle]), None)
+    )
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[0],
+        current_time=order_time,
+    )
+
+    assert strategy.LAST_DCA_SIGNAL_KEY not in custom_data
+
+
+def test_safety_order_skip_log_survives_trade_reload(monkeypatch, caplog) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    reloaded_trade = _trade(False)
+    custom_data: dict[str, str] = {}
+    for current_trade in (trade, reloaded_trade):
+        monkeypatch.setattr(
+            current_trade,
+            "get_custom_data",
+            lambda key, default=None: custom_data.get(key, default),
+        )
+        monkeypatch.setattr(
+            current_trade,
+            "set_custom_data",
+            lambda key, value: custom_data.__setitem__(key, value),
+        )
+    candle = Series(
+        {
+            "date": datetime(2026, 1, 1, 1, 0, tzinfo=UTC),
+            "close": 98.1,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.adx_vw_dca_strategy"):
+        for current_trade in (trade, reloaded_trade):
+            assert (
+                strategy._safety_order_adjustment(
+                    current_trade,
+                    candle,
+                    datetime(2026, 1, 1, 1, 0, tzinfo=UTC),
+                    min_stake=None,
+                    max_stake=1000.0,
+                )
+                is None
+            )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert messages[0].startswith("SO skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 |")
+
+
 def test_safety_order_requires_fresh_signal_and_atr_distance(monkeypatch) -> None:
     strategy = _strategy()
     trade = _trade(False, (100.0,))

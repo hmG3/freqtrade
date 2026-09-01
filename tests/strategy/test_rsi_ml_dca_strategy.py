@@ -707,6 +707,82 @@ def test_order_filled_logs_actual_initial_stake_but_not_safety_orders(caplog) ->
     assert caplog.text == ""
 
 
+def test_initial_fill_consumes_entry_signal_before_safety_order() -> None:
+    strategy = _strategy()
+    strategy.config["stake_currency"] = "USDT"
+    trade = _trade(False)
+    trade.id = 42
+    _add_filled_entries(trade, (100.0,))
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    order_time = datetime(2026, 1, 1, 1, 1, tzinfo=UTC)
+    trade.orders[0].order_date = order_time
+    candle = Series(
+        {
+            "date": signal_time,
+            "close": 97.0,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+    previous_candle = candle.copy()
+    previous_candle["date"] = signal_time.replace(minute=59, hour=0)
+    previous_candle["signal"] = ""
+    execution_candle = candle.copy()
+    execution_candle["date"] = order_time
+    execution_candle["signal"] = ""
+    dataframe = DataFrame([previous_candle, candle, execution_candle])
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[0],
+        current_time=order_time,
+    )
+
+    assert trade.get_custom_data(strategy.LAST_DCA_SIGNAL_KEY) == str(signal_time)
+    assert (
+        strategy._safety_order_adjustment(
+            trade=trade,
+            last_candle=candle,
+            current_time=order_time,
+            min_stake=None,
+            max_stake=1000.0,
+        )
+        is None
+    )
+
+
+def test_initial_fill_does_not_consume_a_post_order_signal() -> None:
+    strategy = _strategy()
+    strategy.config["stake_currency"] = "USDT"
+    trade = _trade(False)
+    trade.id = 43
+    _add_filled_entries(trade, (100.0,))
+    order_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    trade.orders[0].order_date = order_time
+    future_candle = Series(
+        {
+            "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+            "close": 97.0,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+    strategy.dp = SimpleNamespace(
+        get_analyzed_dataframe=lambda *args: (DataFrame([future_candle]), None)
+    )
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[0],
+        current_time=order_time,
+    )
+
+    assert trade.get_custom_data(strategy.LAST_DCA_SIGNAL_KEY) is None
+
+
 def test_take_profit_logs_each_candle_result_once(caplog) -> None:
     strategy = _strategy()
     trade = _trade(False)
@@ -815,6 +891,28 @@ def test_safety_order_atr_skip_is_logged_once(
         trade.entry_side,
     )
     trade.orders.append(entry_order)
+    reloaded_trade = _trade(is_short)
+    reloaded_trade.id = trade.id
+    reloaded_trade.pair = trade.pair
+    reloaded_trade.leverage = trade.leverage
+    reloaded_entry_order = Order.parse_from_ccxt_object(
+        {
+            "id": f"reloaded-entry-{trade.id}",
+            "symbol": reloaded_trade.pair,
+            "status": "closed",
+            "side": reloaded_trade.entry_side,
+            "type": "limit",
+            "price": entry_price,
+            "average": entry_price,
+            "amount": 1000.0,
+            "filled": 1000.0,
+            "cost": entry_price * 1000.0,
+            "remaining": 0.0,
+        },
+        reloaded_trade.pair,
+        reloaded_trade.entry_side,
+    )
+    reloaded_trade.orders.append(reloaded_entry_order)
     candle = Series(
         {
             "date": datetime(2026, 7, 24, 21, 22, tzinfo=UTC),
@@ -830,10 +928,10 @@ def test_safety_order_atr_skip_is_logged_once(
         logging.INFO,
         logger="user_data.strategies.rsi_ml_dca_strategy",
     ):
-        for _ in range(2):
+        for current_trade in (trade, reloaded_trade):
             assert (
                 strategy._safety_order_adjustment(
-                    trade=trade,
+                    trade=current_trade,
                     last_candle=candle,
                     current_time=datetime(2026, 7, 24, 21, 22, tzinfo=UTC),
                     min_stake=None,

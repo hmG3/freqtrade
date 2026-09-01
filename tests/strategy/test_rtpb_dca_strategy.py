@@ -297,6 +297,29 @@ def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch)
     assert messages[1].startswith("SO filled | #81 ETH/USDT:USDT long")
 
 
+def test_order_fill_does_not_use_a_post_order_candle(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    data = _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([100.0]))
+    dataframe["basis"] = 100.5
+    dataframe["atr"] = 1.5
+    _attach_exchange(strategy, dataframe)
+    order_time = datetime(2025, 12, 31, 23, 59, tzinfo=UTC)
+    trade.orders[0].order_date = order_time
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[0],
+        current_time=dataframe["date"].iat[0].to_pydatetime(),
+    )
+
+    assert strategy.TP_BASIS_KEY not in data
+    assert strategy.TP_ATR_KEY not in data
+    assert strategy.LAST_DCA_SIGNAL_KEY not in data
+
+
 @pytest.mark.parametrize("is_short", [False, True])
 def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_rounding(
     caplog,
