@@ -930,6 +930,300 @@ def test_fetch_chase_order_okx_normalizes_parent_and_child(default_conf, mocker,
     assert order["average"] == 2501.5
 
 
+def test_fetch_chase_order_okx_resolves_blank_effective_parent(default_conf, mocker, markets):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.CROSS
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "",
+                "ordIdList": [],
+                "linkedOrd": {"ordId": ""},
+                "instId": "ETH-USDT-SWAP",
+                "state": "effective",
+                "side": "buy",
+                "sz": "2",
+                "actualSz": "",
+                "actualPx": "",
+                "cTime": "1710000000000",
+            }
+        ],
+        "msg": "",
+    }
+    api_mock.private_get_trade_orders_history.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "67890",
+                "instId": "ETH-USDT-SWAP",
+                "state": "filled",
+                "side": "buy",
+                "sz": "2",
+                "accFillSz": "2",
+                "avgPx": "2501.5",
+                "px": "2501.5",
+                "source": "34",
+            }
+        ],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+    exchange._config["dry_run"] = False
+
+    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    api_mock.private_get_trade_orders_history.assert_called_once_with(
+        {"instType": "SWAP", "instId": "ETH-USDT-SWAP", "limit": 100}
+    )
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["status"] == "closed"
+    assert order["amount"] == 20.0
+    assert order["filled"] == 20.0
+    assert order["remaining"] == 0.0
+    assert order["average"] == 2501.5
+
+
+def test_fetch_chase_order_okx_waits_for_effective_child(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "67890",
+                "ordIdList": [],
+                "state": "effective",
+                "side": "sell",
+                "sz": "2",
+                "actualSz": "0",
+                "actualPx": "",
+            }
+        ],
+        "msg": "",
+    }
+    empty_response = {"code": "0", "data": [], "msg": ""}
+    api_mock.private_get_trade_order.return_value = empty_response
+    api_mock.private_get_trade_orders_history.return_value = empty_response
+    api_mock.private_get_trade_orders_pending.return_value = empty_response
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    child_request = {"instType": "SWAP", "instId": "ETH-USDT-SWAP", "limit": 100}
+    api_mock.private_get_trade_order.assert_called_once_with(
+        {"instId": "ETH-USDT-SWAP", "ordId": "67890"}
+    )
+    api_mock.private_get_trade_orders_history.assert_called_once_with(child_request)
+    api_mock.private_get_trade_orders_pending.assert_called_once_with(child_request)
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["status"] == "open"
+    assert order["filled"] == 0.0
+    assert order["remaining"] == 20.0
+
+
+@pytest.mark.parametrize(
+    ("parent_state", "child_state", "future", "endpoint_name", "expected_status"),
+    [
+        ("live", "partially_filled", False, "private_get_trade_orders_pending", "open"),
+        ("canceled", "canceled", True, "private_get_trade_orders_history", "canceled"),
+    ],
+)
+def test_fetch_chase_order_okx_uses_partial_child(
+    default_conf,
+    mocker,
+    markets,
+    parent_state,
+    child_state,
+    future,
+    endpoint_name,
+    expected_status,
+):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {
+        "id": "ETH-USDT-SWAP",
+        "future": future,
+        "swap": not future,
+    }
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "",
+                "state": parent_state,
+                "side": "buy",
+                "sz": "2",
+                "actualSz": "",
+                "actualPx": "",
+            }
+        ],
+        "msg": "",
+    }
+    getattr(api_mock, endpoint_name).return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "67890",
+                "state": child_state,
+                "side": "buy",
+                "sz": "2",
+                "accFillSz": "1",
+                "avgPx": "2501.5",
+                "px": "2501.5",
+            }
+        ],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    getattr(api_mock, endpoint_name).assert_called_once_with(
+        {
+            "instType": "FUTURES" if future else "SWAP",
+            "instId": "ETH-USDT-SWAP",
+            "limit": 100,
+        }
+    )
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["status"] == expected_status
+    assert order["filled"] == 10.0
+    assert order["remaining"] == 10.0
+    assert order["average"] == 2501.5
+
+
+def test_fetch_chase_order_okx_paginates_child_orders(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "",
+                "state": "live",
+                "side": "sell",
+                "sz": "2",
+                "actualSz": "",
+                "actualPx": "",
+                "cTime": "1000",
+            }
+        ],
+        "msg": "",
+    }
+    first_page = [
+        {"algoId": "other", "ordId": str(200 - index), "cTime": "2000"} for index in range(100)
+    ]
+    child_order = {
+        "algoId": "12345",
+        "ordId": "67890",
+        "state": "live",
+        "side": "sell",
+        "sz": "2",
+        "accFillSz": "0",
+        "avgPx": "",
+        "px": "2501.5",
+        "cTime": "1500",
+    }
+    api_mock.private_get_trade_orders_pending.side_effect = [
+        {"code": "0", "data": first_page, "msg": ""},
+        {"code": "0", "data": [child_order], "msg": ""},
+    ]
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    child_request = {"instType": "SWAP", "instId": "ETH-USDT-SWAP", "limit": 100}
+    assert [args[0] for args, _ in api_mock.private_get_trade_orders_pending.call_args_list] == [
+        child_request,
+        child_request | {"after": "101"},
+    ]
+    assert order["id_chase"] == "67890"
+    assert order["status"] == "open"
+
+
+def test_fetch_chase_order_okx_translates_child_error(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "",
+                "state": "live",
+                "side": "buy",
+                "sz": "2",
+                "actualSz": "",
+                "actualPx": "",
+            }
+        ],
+        "msg": "",
+    }
+    api_mock.private_get_trade_orders_pending.return_value = {
+        "code": "50000",
+        "data": [],
+        "msg": "Order history unavailable",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    with pytest.raises(TemporaryError, match="Order history unavailable"):
+        exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+
 def test_cancel_chase_order_okx(default_conf, mocker, markets):
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
