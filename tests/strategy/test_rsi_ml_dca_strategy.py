@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from pandas import DataFrame, Series, date_range
 
+from freqtrade.enums import MarginMode
 from freqtrade.persistence import CustomDataWrapper, Order, Trade
 from user_data.strategies.rsi_ml_dca_strategy import (
     RSIMLDCAStrategy,
@@ -32,7 +33,7 @@ def _reset_trade_custom_data() -> Iterator[None]:
     CustomDataWrapper.use_db = previous_use_db
 
 
-def _trade(is_short: bool) -> Trade:
+def _trade(is_short: bool, open_rate: float = 100.0) -> Trade:
     return Trade(
         pair="ETH/USDT:USDT",
         stake_amount=100.0,
@@ -41,7 +42,7 @@ def _trade(is_short: bool) -> Trade:
         fee_close=0.001,
         is_open=True,
         open_date=datetime(2026, 1, 1, tzinfo=UTC),
-        open_rate=100.0,
+        open_rate=open_rate,
         exchange="binance",
         strategy="RSIMLDCAStrategy",
         timeframe=1,
@@ -1028,3 +1029,55 @@ def test_leverage_respects_callback_exchange_cap() -> None:
     )
 
     assert leverage == 18.18
+
+
+@pytest.mark.parametrize(
+    ("margin_mode", "is_short", "open_rate", "expected_stop"),
+    [
+        (MarginMode.CROSS, False, 80.0, 0.008),
+        (MarginMode.CROSS, True, 120.0, 239.988),
+        (MarginMode.ISOLATED, False, 80.0, 72.0008),
+        (MarginMode.ISOLATED, True, 120.0, 131.9988),
+    ],
+)
+def test_custom_stoploss_reanchors_from_weighted_open_rate_after_fill(
+    margin_mode: MarginMode,
+    is_short: bool,
+    open_rate: float,
+    expected_stop: float,
+) -> None:
+    strategy = RSIMLDCAStrategy({"margin_mode": margin_mode})
+    trade = _trade(is_short, open_rate)
+    current_rate = 100.0
+
+    stoploss = strategy.custom_stoploss(
+        trade.pair,
+        trade,
+        datetime(2026, 1, 2, tzinfo=UTC),
+        current_rate,
+        trade.calc_profit_ratio(current_rate),
+        after_fill=True,
+    )
+
+    assert strategy.use_custom_stoploss is True
+    assert stoploss is not None
+    trade.adjust_stop_loss(current_rate, stoploss, allow_refresh=True)
+    assert trade.stop_loss == pytest.approx(expected_stop)
+
+
+@pytest.mark.parametrize("margin_mode", [MarginMode.CROSS, MarginMode.ISOLATED])
+def test_custom_stoploss_does_not_move_between_fills(margin_mode: MarginMode) -> None:
+    strategy = RSIMLDCAStrategy({"margin_mode": margin_mode})
+    trade = _trade(False)
+
+    assert (
+        strategy.custom_stoploss(
+            trade.pair,
+            trade,
+            datetime(2026, 1, 2, tzinfo=UTC),
+            105.0,
+            trade.calc_profit_ratio(105.0),
+            after_fill=False,
+        )
+        is None
+    )
