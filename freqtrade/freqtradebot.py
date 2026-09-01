@@ -2639,7 +2639,7 @@ class FreqtradeBot(LoggingMixin):
         """
         if not self._trades_valid_for_fee(trades):
             trades = self.exchange.get_trades_for_order(
-                self.exchange.get_order_id_conditional(order), trade.pair, order_obj.order_date
+                self.exchange.get_order_ids_conditional(order), trade.pair, order_obj.order_date
             )
 
         if len(trades) == 0:

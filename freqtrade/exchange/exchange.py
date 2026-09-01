@@ -7,7 +7,7 @@ import asyncio
 import inspect
 import logging
 import signal
-from collections.abc import Coroutine, Generator
+from collections.abc import Collection, Coroutine, Generator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from math import floor, isnan
@@ -2482,7 +2482,11 @@ class Exchange:
 
     @retrier
     def get_trades_for_order(
-        self, order_id: str, pair: str, since: datetime, params: dict | None = None
+        self,
+        order_id: str | Collection[str],
+        pair: str,
+        since: datetime,
+        params: dict | None = None,
     ) -> list:
         """
         Fetch Orders using the "fetch_my_trades" endpoint and filter them by order-id.
@@ -2496,7 +2500,7 @@ class Exchange:
         instead of from the last 5 seconds, however fails for UTC- timezones,
         since we're then asking for trades with a "since" argument in the future.
 
-        :param order_id order_id: Order-id as given when creating the order
+        :param order_id: Order-id or executable child order-ids
         :param pair: Pair the order is for
         :param since: datetime object of the order creation time. Assumes object is in UTC.
         """
@@ -2513,7 +2517,18 @@ class Exchange:
                 int((since.replace(tzinfo=UTC).timestamp() - 5) * 1000),
                 params=_params,
             )
-            matched_trades = [trade for trade in my_trades if trade["order"] == order_id]
+            order_ids = {order_id} if isinstance(order_id, str) else set(order_id)
+            matched_trades = []
+            seen_execution_ids = set()
+            for trade in my_trades:
+                if trade["order"] not in order_ids:
+                    continue
+                execution_id = trade.get("id")
+                if execution_id and execution_id in seen_execution_ids:
+                    continue
+                if execution_id:
+                    seen_execution_ids.add(execution_id)
+                matched_trades.append(trade)
 
             self._log_exchange_response("get_trades_for_order", matched_trades)
 
@@ -2543,6 +2558,18 @@ class Exchange:
         ):
             return safe_value_fallback(order, "id_stop", "id")
         return order["id"]
+
+    def get_order_ids_conditional(self, order: CcxtOrder) -> list[str]:
+        """Return every executable child id for a native conditional order."""
+        primary_id = self.get_order_id_conditional(order)
+        if order.get("type") != "chase" or not isinstance(order.get("id_chase_list"), list):
+            return [primary_id]
+        child_ids = list(
+            dict.fromkeys(str(child_id) for child_id in order["id_chase_list"] if child_id)
+        )
+        if primary_id not in child_ids:
+            child_ids.append(primary_id)
+        return child_ids
 
     @retrier
     def get_fee(

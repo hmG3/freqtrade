@@ -28,6 +28,7 @@ from freqtrade.exceptions import (
     InvalidOrderException,
     OperationalException,
     PricingError,
+    RetryableOrderError,
     TemporaryError,
 )
 from freqtrade.freqtradebot import FreqtradeBot
@@ -2364,6 +2365,37 @@ def test_manage_open_orders_buy_exception(
     assert len(open_trade.open_orders) == 1
 
 
+def test_manage_open_chase_order_settlement_keeps_trade_slot(
+    default_conf_usdt, open_trade, mocker
+) -> None:
+    default_conf_usdt["max_open_trades"] = 1
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    chase_order = open_trade.orders[0]
+    chase_order.order_id = "chase-parent"
+    chase_order.order_type = "chase"
+    chase_order.status = "open"
+    chase_order.ft_is_open = True
+    Trade.session.add(open_trade)
+    Trade.commit()
+    fetch_order = mocker.patch.object(
+        freqtrade.exchange,
+        "fetch_order_or_stoploss_order",
+        side_effect=RetryableOrderError("OKX chase order is still settling."),
+    )
+    create_trade = mocker.patch.object(freqtrade, "create_trade", return_value=True)
+
+    freqtrade.manage_open_orders()
+    available_slots = default_conf_usdt["max_open_trades"] - Trade.get_open_trade_count()
+    entries = freqtrade.enter_positions(available_slots)
+
+    assert available_slots == 0
+    assert entries == 0
+    assert Trade.get_open_trade_count() == 1
+    assert open_trade.open_orders_ids == ["chase-parent"]
+    fetch_order.assert_called_once_with("chase-parent", open_trade.pair, order_type="chase")
+    create_trade.assert_not_called()
+
+
 @pytest.mark.parametrize("is_short", [False, True])
 def test_manage_open_orders_exit_usercustom(
     default_conf_usdt, ticker_usdt, limit_sell_order_old, mocker, is_short, open_trade_usdt, caplog
@@ -4235,6 +4267,34 @@ def test_get_real_amount_multi(
     assert trade.fee_open_currency is not None
     assert trade.fee_close_cost is None
     assert trade.fee_close_currency is None
+
+
+def test_get_real_amount_chase_uses_all_child_order_ids(
+    default_conf_usdt, trades_for_order2, buy_order_fee, fee, mocker
+):
+    chase_order = deepcopy(buy_order_fee) | {
+        "id": "chase-parent",
+        "id_chase": "child-order-2",
+        "id_chase_list": ["child-order-1", "child-order-2"],
+        "type": "chase",
+    }
+    get_trades = mocker.patch(f"{EXMS}.get_trades_for_order", return_value=trades_for_order2)
+    trade = Trade(
+        pair="LTC/ETH",
+        amount=sum(execution["amount"] for execution in trades_for_order2),
+        exchange="binance",
+        fee_open=fee.return_value,
+        fee_close=fee.return_value,
+        open_rate=0.245441,
+    )
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    order_obj = Order.parse_from_ccxt_object(chase_order, "LTC/ETH", "buy")
+
+    freqtrade.get_real_amount(trade, chase_order, order_obj)
+
+    get_trades.assert_called_once_with(
+        ["child-order-1", "child-order-2"], "LTC/ETH", order_obj.order_date
+    )
 
 
 def test_get_real_amount_invalid_order(

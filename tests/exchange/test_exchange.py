@@ -4698,15 +4698,20 @@ def test_cancel_order_with_result_dispatches_chase(default_conf, mocker):
 def test_get_order_id_conditional_uses_chase_child(default_conf, mocker):
     exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
 
-    assert (
-        exchange.get_order_id_conditional(
-            {"id": "chase-parent", "id_chase": "child-order", "type": "chase"}
-        )
-        == "child-order"
-    )
+    chase_order = {
+        "id": "chase-parent",
+        "id_chase": "child-order-2",
+        "id_chase_list": ["child-order-1", "child-order-2", "child-order-1"],
+        "type": "chase",
+    }
+    assert exchange.get_order_id_conditional(chase_order) == "child-order-2"
+    assert exchange.get_order_ids_conditional(chase_order) == ["child-order-1", "child-order-2"]
     assert (
         exchange.get_order_id_conditional({"id": "chase-parent", "type": "chase"}) == "chase-parent"
     )
+    assert exchange.get_order_ids_conditional({"id": "regular-order", "type": "limit"}) == [
+        "regular-order"
+    ]
 
 
 @pytest.mark.parametrize("exchange_name", EXCHANGES)
@@ -4810,6 +4815,44 @@ def test_get_trades_for_order(default_conf, mocker, exchange_name, trading_mode,
 
     mocker.patch(f"{EXMS}.exchange_has", MagicMock(return_value=False))
     assert exchange.get_trades_for_order(order_id, "ETH/USDT:USDT", since) == []
+
+
+def test_get_trades_for_order_matches_multiple_ids_and_deduplicates(default_conf, mocker):
+    default_conf["dry_run"] = False
+    mocker.patch(f"{EXMS}.exchange_has", return_value=True)
+    api_mock = MagicMock()
+    child_trade_1 = {
+        "id": "execution-1",
+        "order": "child-order-1",
+        "symbol": "ETH/USDT",
+        "amount": 0.4,
+        "cost": 1000.0,
+        "price": 2500.0,
+    }
+    child_trade_2 = {
+        "id": "execution-2",
+        "order": "child-order-2",
+        "symbol": "ETH/USDT",
+        "amount": 0.6,
+        "cost": 1500.0,
+        "price": 2500.0,
+    }
+    api_mock.fetch_my_trades.return_value = [
+        child_trade_1,
+        child_trade_1.copy(),
+        child_trade_2,
+        child_trade_2 | {"order": "unrelated-order", "id": "execution-3"},
+    ]
+    exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange="binance")
+
+    trades = exchange.get_trades_for_order(
+        ["child-order-1", "child-order-2"],
+        "ETH/USDT",
+        datetime(2026, 8, 31, 18, 12, 0),
+    )
+
+    assert [trade["id"] for trade in trades] == ["execution-1", "execution-2"]
+    api_mock.fetch_my_trades.assert_called_once()
 
 
 @pytest.mark.parametrize("exchange_name", EXCHANGES)

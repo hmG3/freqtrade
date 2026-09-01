@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from math import isclose
 
 import ccxt
 
@@ -62,6 +63,7 @@ class Okx(Exchange):
     net_only = True
 
     _ccxt_params: dict = {"options": {"brokerId": "ffb5405ad327SUDE"}}
+    _chase_terminal_settlement_ms = 15_000
 
     def ohlcv_candle_limit(
         self, timeframe: str, candle_type: CandleType, since_ms: int | None = None
@@ -205,14 +207,19 @@ class Okx(Exchange):
         }
 
     @staticmethod
-    def _get_chase_child_id(item: dict) -> str | None:
+    def _get_chase_child_ids(item: dict) -> list[str]:
         child_ids = [item.get("ordId")]
         linked_order = item.get("linkedOrd")
         if isinstance(linked_order, dict):
             child_ids.append(linked_order.get("ordId"))
         if isinstance(item.get("ordIdList"), list):
             child_ids.extend(reversed(item["ordIdList"]))
-        return next((str(order_id) for order_id in child_ids if order_id), None)
+        return list(dict.fromkeys(str(order_id) for order_id in child_ids if order_id))
+
+    @classmethod
+    def _get_chase_child_id(cls, item: dict) -> str | None:
+        child_ids = cls._get_chase_child_ids(item)
+        return child_ids[0] if child_ids else None
 
     @staticmethod
     def _get_chase_child_response_items(response: dict) -> list[dict]:
@@ -220,19 +227,60 @@ class Okx(Exchange):
             raise ccxt.ExchangeError(response.get("msg") or str(response))
         return response.get("data") or []
 
-    def _fetch_chase_child_order(self, pair: str, item: dict) -> dict | None:
-        order_id = str(item["algoId"])
-        market = self.markets[pair]
-        child_id = self._get_chase_child_id(item)
-        if child_id:
-            response = self._api.private_get_trade_order(
-                {"instId": market["id"], "ordId": child_id}
-            )
-            self._log_exchange_response("chase_child_order", response)
-            child_orders = self._get_chase_child_response_items(response)
-            if child_orders:
-                return child_orders[0]
+    @staticmethod
+    def _chase_child_update_time(child_order: dict) -> int:
+        return int(child_order.get("uTime") or child_order.get("cTime") or 0)
 
+    def _merge_chase_child_order(self, child_orders: dict[str, dict], child_order: dict) -> None:
+        child_id = child_order.get("ordId")
+        if not child_id:
+            return
+        child_id = str(child_id)
+        current = child_orders.get(child_id)
+        if current is None or self._chase_child_update_time(child_order) >= (
+            self._chase_child_update_time(current)
+        ):
+            child_orders[child_id] = child_order
+
+    def _fetch_chase_child_order_pages(
+        self,
+        endpoint,
+        log_name: str,
+        request: dict,
+        item: dict,
+        known_child_ids: set[str],
+        child_orders: dict[str, dict],
+    ) -> None:
+        parent_id = str(item["algoId"])
+        page_request = request
+        previous_cursor = None
+        while True:
+            response = endpoint(page_request)
+            self._log_exchange_response(log_name, response)
+            page = self._get_chase_child_response_items(response)
+            for child_order in page:
+                child_id = str(child_order.get("ordId") or "")
+                if str(child_order.get("algoId") or "") == parent_id or (
+                    child_id in known_child_ids
+                ):
+                    self._merge_chase_child_order(child_orders, child_order)
+            if len(page) < request["limit"]:
+                break
+            oldest_order = page[-1]
+            oldest_order_id = oldest_order.get("ordId")
+            parent_time = int(item.get("cTime") or 0)
+            oldest_time = int(oldest_order.get("cTime") or 0)
+            if (
+                not oldest_order_id
+                or str(oldest_order_id) == previous_cursor
+                or (parent_time and oldest_time and oldest_time < parent_time)
+            ):
+                break
+            previous_cursor = str(oldest_order_id)
+            page_request = request | {"after": previous_cursor}
+
+    def _fetch_chase_child_orders(self, pair: str, item: dict) -> list[dict]:
+        market = self.markets[pair]
         request = {
             "instType": "FUTURES" if market.get("future") else "SWAP",
             "instId": market["id"],
@@ -250,79 +298,167 @@ class Okx(Exchange):
                 ("chase_child_order_history", self._api.private_get_trade_orders_history),
             )
         )
+        known_child_ids = set(self._get_chase_child_ids(item))
+        child_orders: dict[str, dict] = {}
         for log_name, endpoint in endpoints:
-            page_request = request
-            previous_cursor = None
-            while True:
-                response = endpoint(page_request)
-                self._log_exchange_response(log_name, response)
-                child_orders = self._get_chase_child_response_items(response)
-                matches = [
-                    child for child in child_orders if str(child.get("algoId") or "") == order_id
-                ]
-                if matches:
-                    return max(
-                        matches,
-                        key=lambda child: (
-                            abs(float(child.get("accFillSz") or 0.0)),
-                            int(child.get("uTime") or child.get("cTime") or 0),
-                        ),
-                    )
-                if len(child_orders) < request["limit"]:
-                    break
-                oldest_order = child_orders[-1]
-                oldest_order_id = oldest_order.get("ordId")
-                parent_time = int(item.get("cTime") or 0)
-                oldest_time = int(oldest_order.get("cTime") or 0)
-                if (
-                    not oldest_order_id
-                    or str(oldest_order_id) == previous_cursor
-                    or (parent_time and oldest_time < parent_time)
-                ):
-                    break
-                previous_cursor = str(oldest_order_id)
-                page_request = request | {"after": previous_cursor}
-        return None
+            self._fetch_chase_child_order_pages(
+                endpoint,
+                log_name,
+                request,
+                item,
+                known_child_ids,
+                child_orders,
+            )
+
+        latest_child_id = self._get_chase_child_id(item)
+        if latest_child_id and latest_child_id not in child_orders:
+            response = self._api.private_get_trade_order(
+                {"instId": market["id"], "ordId": latest_child_id}
+            )
+            self._log_exchange_response("chase_child_order", response)
+            for child_order in self._get_chase_child_response_items(response):
+                self._merge_chase_child_order(child_orders, child_order)
+        return list(child_orders.values())
+
+    @staticmethod
+    def _chase_child_fill(child_order: dict) -> float:
+        return abs(float(child_order.get("accFillSz") or 0.0))
+
+    @staticmethod
+    def _chase_child_is_active(child_order: dict) -> bool:
+        return str(child_order.get("state") or "").lower() in ("live", "partially_filled")
+
+    def _get_chase_execution(
+        self, item: dict, child_orders: list[dict]
+    ) -> tuple[float, float, float, float | None]:
+        amount = abs(float(item.get("sz") or 0.0))
+        parent_fill = abs(float(item.get("actualSz") or 0.0))
+        child_fill = sum(self._chase_child_fill(child_order) for child_order in child_orders)
+        filled = min(amount, max(parent_fill, child_fill))
+        if amount and isclose(filled, amount, rel_tol=0.0, abs_tol=1e-12):
+            filled = amount
+
+        weighted_cost = 0.0
+        weighted_fill = 0.0
+        for child_order in child_orders:
+            child_size = self._chase_child_fill(child_order)
+            average_value = child_order.get("avgPx")
+            if child_size and average_value not in (None, ""):
+                weighted_cost += child_size * float(average_value)
+                weighted_fill += child_size
+
+        parent_average_value = item.get("actualPx")
+        parent_average = (
+            float(parent_average_value) if parent_average_value not in (None, "") else None
+        )
+        if weighted_fill and child_fill >= filled and weighted_fill >= filled:
+            average = weighted_cost / weighted_fill
+        elif parent_average is not None and parent_fill >= filled:
+            average = parent_average
+        elif weighted_fill:
+            average = weighted_cost / weighted_fill
+        else:
+            average = None
+        return parent_fill, child_fill, filled, average
+
+    def _chase_terminal_is_settling(self, item: dict) -> bool:
+        parent_id = str(item["algoId"])
+        now = dt_ts()
+        update_time = int(item.get("uTime") or 0)
+        if update_time:
+            reference_time = update_time
+        else:
+            first_seen = getattr(self, "_chase_terminal_first_seen", None)
+            if first_seen is None:
+                first_seen = self._chase_terminal_first_seen = {}
+            reference_time = first_seen.setdefault(parent_id, now)
+        return now - reference_time < self._chase_terminal_settlement_ms
+
+    def _clear_chase_terminal_observation(self, item: dict) -> None:
+        first_seen = getattr(self, "_chase_terminal_first_seen", None)
+        if first_seen is not None:
+            first_seen.pop(str(item["algoId"]), None)
+
+    def _get_chase_status(
+        self,
+        item: dict,
+        amount: float,
+        filled: float,
+        child_orders: list[dict] | None = None,
+    ) -> str:
+        state = str(item.get("state") or "").lower()
+        fill_complete = amount > 0 and filled >= amount
+        if fill_complete:
+            self._clear_chase_terminal_observation(item)
+            return "closed"
+        if state in ("live", "pause") or any(
+            self._chase_child_is_active(child_order) for child_order in child_orders or []
+        ):
+            self._clear_chase_terminal_observation(item)
+            return "open"
+        if filled > 0:
+            self._clear_chase_terminal_observation(item)
+            return "canceled"
+        if state in ("order_failed", "failed", "rejected", "partially_failed"):
+            self._clear_chase_terminal_observation(item)
+            return "rejected"
+        if state == "effective":
+            raise RetryableOrderError(
+                f"OKX chase order {item['algoId']} execution is not yet authoritative."
+            )
+        if state in ("canceled", "cancelled", "partially_effective", "partially_canceled"):
+            if self._chase_terminal_is_settling(item):
+                raise RetryableOrderError(f"OKX chase order {item['algoId']} is still settling.")
+            self._clear_chase_terminal_observation(item)
+            return "canceled"
+        return "open"
 
     def _normalize_chase_order(
-        self, pair: str, item: dict, child_order: dict | None = None
+        self, pair: str, item: dict, child_orders: list[dict] | None = None
     ) -> CcxtOrder:
+        child_orders = child_orders or []
         amount = abs(float(item.get("sz") or 0.0))
-        filled = abs(
-            float(
-                child_order.get("accFillSz")
-                if child_order and child_order.get("accFillSz") not in (None, "")
-                else item.get("actualSz") or 0.0
-            )
-        )
+        parent_fill, child_fill, filled, average = self._get_chase_execution(item, child_orders)
         remaining = max(amount - filled, 0.0)
-        average_value = (child_order.get("avgPx") if child_order else None) or item.get("actualPx")
-        average = float(average_value) if average_value not in (None, "") else None
-        price_value = (child_order.get("px") if child_order else None) or item.get("ordPx")
+        selected_child = max(
+            child_orders,
+            key=lambda child_order: (
+                self._chase_child_fill(child_order),
+                self._chase_child_update_time(child_order),
+            ),
+            default=None,
+        )
+        price_value = (selected_child.get("px") if selected_child else None) or item.get("ordPx")
         price = float(price_value) if price_value not in (None, "") else average
         state = str(item.get("state") or "").lower()
-        child_state = str(child_order.get("state") or "").lower() if child_order else ""
-        if child_state == "filled":
-            status = "closed"
-        elif child_state in ("live", "partially_filled"):
-            status = "open"
-        elif child_state in ("canceled", "cancelled", "mmp_canceled"):
-            status = "open" if state in ("live", "pause") else "canceled"
-        elif state in ("live", "pause"):
-            status = "open"
-        elif state == "effective":
-            # OKX can mark a chase parent effective while omitting all execution fields.
-            # Keep polling until its spawned regular order is visible in order history.
-            parent_fill_complete = abs(float(item.get("actualSz") or 0.0)) > 0 and item.get(
-                "actualPx"
-            ) not in (None, "")
-            status = "closed" if parent_fill_complete else "open"
-        elif state in ("canceled", "cancelled", "partially_effective", "partially_canceled"):
-            status = "canceled"
-        elif state in ("order_failed", "failed", "rejected"):
-            status = "rejected"
-        else:
-            status = "open"
+        status = self._get_chase_status(item, amount, filled, child_orders)
+        child_ids = list(
+            dict.fromkeys(
+                [
+                    str(child_order["ordId"])
+                    for child_order in child_orders
+                    if child_order.get("ordId")
+                ]
+                + self._get_chase_child_ids(item)
+            )
+        )
+        diagnostics = {
+            "parentFill": parent_fill,
+            "childFill": child_fill,
+            "selectedFill": filled,
+            "requestedSize": amount,
+        }
+        logger.debug(
+            "OKX chase reconciliation parent=%s state=%s children=%s child_states=%s "
+            "parent_fill=%s child_fill=%s selected_fill=%s",
+            item["algoId"],
+            state,
+            child_ids,
+            [child_order.get("state") for child_order in child_orders],
+            parent_fill,
+            child_fill,
+            filled,
+        )
 
         order: CcxtOrder = {
             "id": str(item["algoId"]),
@@ -334,15 +470,26 @@ class Okx(Exchange):
             "amount": amount,
             "filled": filled,
             "remaining": remaining,
-            "cost": filled * average if average is not None else 0.0,
+            "cost": self._contracts_to_amount(pair, filled) * average
+            if average is not None
+            else 0.0,
             "status": status,
             "fee": {},
-            "info": item | ({"childOrder": child_order} if child_order else {}),
+            "info": item
+            | {
+                "childOrders": child_orders,
+                "chaseDiagnostics": diagnostics,
+            },
         }
-        child_id = str(child_order["ordId"]) if child_order and child_order.get("ordId") else None
-        child_id = child_id or self._get_chase_child_id(item)
+        child_id = (
+            str(selected_child["ordId"])
+            if selected_child and selected_child.get("ordId")
+            else self._get_chase_child_id(item)
+        )
         if child_id:
             order["id_chase"] = child_id
+        if child_ids:
+            order["id_chase_list"] = child_ids
         if item.get("cTime"):
             order["timestamp"] = int(item["cTime"])
         return self._order_contracts_to_amount(order)
@@ -355,21 +502,8 @@ class Okx(Exchange):
             response = self._api.private_get_trade_order_algo({"algoId": order_id})
             self._log_exchange_response("fetch_chase_order", response)
             item = self._get_chase_response_item(response)
-            state = str(item.get("state") or "").lower()
-            parent_execution_complete = abs(float(item.get("actualSz") or 0.0)) > 0 and item.get(
-                "actualPx"
-            ) not in (None, "")
-            needs_child_order = state in (
-                "live",
-                "pause",
-                "effective",
-                "canceled",
-                "cancelled",
-                "partially_effective",
-                "partially_canceled",
-            ) and (not self._get_chase_child_id(item) or not parent_execution_complete)
-            child_order = self._fetch_chase_child_order(pair, item) if needs_child_order else None
-            return self._normalize_chase_order(pair, item, child_order)
+            child_orders = self._fetch_chase_child_orders(pair, item)
+            return self._normalize_chase_order(pair, item, child_orders)
         except ccxt.OrderNotFound as e:
             raise RetryableOrderError(
                 f"Chase order not found (pair: {pair} id: {order_id}). Message: {e}"
