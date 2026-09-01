@@ -37,6 +37,8 @@ class Okx(Exchange):
     }
     _ft_has_futures: FtHas = {
         "chase_order": True,
+        "cross_margin_stake_currencies": ["USDT"],
+        "cross_liquidation_price_fallback": True,
         "tickers_have_quoteVolume": False,
         "stop_price_type_field": "slTriggerPxType",
         "stop_price_type_value_mapping": {
@@ -53,7 +55,7 @@ class Okx(Exchange):
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
         # (TradingMode.MARGIN, MarginMode.CROSS),
-        # (TradingMode.FUTURES, MarginMode.CROSS),
+        (TradingMode.FUTURES, MarginMode.CROSS),
         (TradingMode.FUTURES, MarginMode.ISOLATED),
     ]
 
@@ -95,8 +97,17 @@ class Okx(Exchange):
             if self.trading_mode == TradingMode.FUTURES and not self._config["dry_run"]:
                 accounts = self._api.fetch_accounts()
                 self._log_exchange_response("fetch_accounts", accounts)
-                if len(accounts) > 0:
-                    self.net_only = accounts[0].get("info", {}).get("posMode") == "net_mode"
+                account_info = accounts[0].get("info", {}) if len(accounts) > 0 else {}
+                if self.margin_mode == MarginMode.CROSS and (
+                    account_info.get("acctLv") != "2"
+                    or account_info.get("posMode") not in ("net_mode", "long_short_mode")
+                ):
+                    raise OperationalException(
+                        "OKX cross margin requires OKX account level 2 (Futures mode) and "
+                        "a supported position mode."
+                    )
+                if account_info:
+                    self.net_only = account_info.get("posMode") == "net_mode"
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:

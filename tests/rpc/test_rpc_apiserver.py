@@ -2802,6 +2802,7 @@ def test_api_exchanges(botclient):
         "alias_for": None,
         "trade_modes": [
             {"trading_mode": "spot", "margin_mode": ""},
+            {"trading_mode": "futures", "margin_mode": "cross"},
             {"trading_mode": "futures", "margin_mode": "isolated"},
         ],
     }

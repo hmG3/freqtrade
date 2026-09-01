@@ -1,11 +1,98 @@
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import ccxt
 import pytest
 
 from freqtrade.enums import MarginMode, TradingMode
-from freqtrade.exceptions import InvalidOrderException
+from freqtrade.exceptions import (
+    DDosProtection,
+    InvalidOrderException,
+    OperationalException,
+    TemporaryError,
+)
 from tests.conftest import EXMS, get_patched_exchange
+
+
+@pytest.mark.parametrize("margin_mode", [0, "0", 3, "3"])
+@pytest.mark.parametrize("position_mode", ["single", "dual", "dual_plus"])
+def test_additional_exchange_init_gate_cross_account(
+    default_conf, mocker, margin_mode, position_mode
+):
+    api_mock = MagicMock()
+    api_mock.options = {"unifiedAccount": margin_mode in (3, "3")}
+    api_mock.fetch2.return_value = {
+        "margin_mode": margin_mode,
+        "position_mode": position_mode,
+    }
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange._config["stake_currency"] = "USDT"
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    exchange.additional_exchange_init()
+
+    assert exchange.position_mode == position_mode
+    api_mock.load_unified_status.assert_called_once_with()
+    api_mock.fetch2.assert_called_once_with(
+        "{settle}/accounts",
+        ["private", "futures"],
+        "GET",
+        {"settle": "usdt"},
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"margin_mode": 1, "position_mode": "single"},
+        {"margin_mode": 2, "position_mode": "single"},
+        {"margin_mode": False, "position_mode": "single"},
+        {"margin_mode": 3.5, "position_mode": "single"},
+        {"margin_mode": "invalid", "position_mode": "single"},
+        {"margin_mode": 0, "position_mode": "invalid"},
+        {},
+        None,
+    ],
+)
+def test_additional_exchange_init_gate_cross_rejects_account_mode(default_conf, mocker, payload):
+    api_mock = MagicMock()
+    api_mock.options = {"unifiedAccount": False}
+    api_mock.fetch2.return_value = payload
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange._config["stake_currency"] = "USDT"
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    with pytest.raises(OperationalException, match="cross margin requires"):
+        exchange.additional_exchange_init()
+
+
+@pytest.mark.parametrize(
+    "exception,expected_exception",
+    [
+        (ccxt.DDoSProtection("ddos"), DDosProtection),
+        (ccxt.OperationFailed("temporary"), TemporaryError),
+        (ccxt.BaseError("fatal"), OperationalException),
+    ],
+)
+def test_additional_exchange_init_gate_cross_translates_api_errors(
+    default_conf, mocker, exception, expected_exception
+):
+    mocker.patch("freqtrade.exchange.common.time.sleep")
+    api_mock = MagicMock()
+    api_mock.options = {"unifiedAccount": False}
+    api_mock.fetch2.side_effect = exception
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange._config["stake_currency"] = "USDT"
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    with pytest.raises(expected_exception):
+        exchange.additional_exchange_init()
 
 
 @pytest.mark.usefixtures("init_persistence")
@@ -118,6 +205,100 @@ def test_fetch_my_trades_gate(mocker, default_conf, takerormaker, rate, cost):
     assert trade["fee"]["rate"] == rate
     assert trade["fee"]["currency"] == "USDT"
     assert trade["fee"]["cost"] == cost
+
+
+@pytest.mark.parametrize("margin_mode", [MarginMode.ISOLATED, MarginMode.CROSS])
+def test_gate_leverage_preparation_passes_margin_mode(default_conf, mocker, margin_mode):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = margin_mode
+    set_leverage = mocker.patch.object(exchange, "_set_leverage")
+    set_margin_mode = mocker.patch.object(exchange, "set_margin_mode")
+
+    exchange._lev_prep("ETH/USDT:USDT", 3.0, "buy")
+
+    set_leverage.assert_called_once_with(
+        3.0,
+        "ETH/USDT:USDT",
+        False,
+        params={"marginMode": margin_mode.value},
+    )
+    set_margin_mode.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "position_mode,expected",
+    [("single", {}), ("dual", {}), ("dual_plus", {"pos_margin_mode": "cross"})],
+)
+def test_gate_order_params_cross_split_position_mode(default_conf, mocker, position_mode, expected):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+    exchange.position_mode = position_mode
+
+    params = exchange._get_params("buy", "limit", 3.0, False)
+
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    "position_mode,expected_position_margin_mode",
+    [("single", None), ("dual", None), ("dual_plus", "cross")],
+)
+def test_gate_stop_params_cross_split_position_mode(
+    default_conf, mocker, position_mode, expected_position_margin_mode
+):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="gate")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+    exchange.position_mode = position_mode
+
+    params = exchange._get_stop_params("sell", "limit", 100.0)
+
+    assert params["stopPrice"] == 100.0
+    if expected_position_margin_mode:
+        assert params["pos_margin_mode"] == expected_position_margin_mode
+    else:
+        assert "pos_margin_mode" not in params
+
+
+@pytest.mark.parametrize(
+    "position_mode,expected_position_margin_mode",
+    [("single", None), ("dual", None), ("dual_plus", "cross")],
+)
+def test_create_chase_order_gate_cross_position_mode(
+    default_conf, mocker, markets, position_mode, expected_position_margin_mode
+):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.CROSS
+    api_mock = MagicMock()
+    api_mock.fetch2.return_value = {"id": "12345"}
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={"ETH/USDT:USDT": markets["ETH/USDT:USDT"]},
+    )
+    exchange._config["dry_run"] = False
+    exchange.position_mode = position_mode
+    mocker.patch.object(exchange, "_lev_prep")
+
+    exchange.create_order(
+        pair="ETH/USDT:USDT",
+        ordertype="chase",
+        side="buy",
+        amount=20.0,
+        rate=2500.0,
+        leverage=3.0,
+    )
+
+    request = api_mock.fetch2.call_args.args[3]
+    if expected_position_margin_mode:
+        assert request["pos_margin_mode"] == expected_position_margin_mode
+    else:
+        assert "pos_margin_mode" not in request
 
 
 @pytest.mark.parametrize(

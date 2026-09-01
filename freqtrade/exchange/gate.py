@@ -28,6 +28,7 @@ class Gate(Exchange):
     """
 
     unified_account = False
+    position_mode: str | None = None
 
     _ft_has: FtHas = {
         "order_time_in_force": ["GTC", "IOC"],
@@ -44,6 +45,8 @@ class Gate(Exchange):
 
     _ft_has_futures: FtHas = {
         "chase_order": True,
+        "cross_margin_stake_currencies": ["USDT"],
+        "cross_liquidation_price_fallback": True,
         "needs_trading_fees": True,
         "marketOrderRequiresPrice": False,
         "funding_fee_candle_limit": 90,
@@ -61,7 +64,7 @@ class Gate(Exchange):
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
         # (TradingMode.MARGIN, MarginMode.CROSS),
-        # (TradingMode.FUTURES, MarginMode.CROSS),
+        (TradingMode.FUTURES, MarginMode.CROSS),
         (TradingMode.FUTURES, MarginMode.ISOLATED),
     ]
 
@@ -84,6 +87,43 @@ class Gate(Exchange):
                 else:
                     self.unified_account = False
                     logger.info("Gate: Classic account.")
+
+                if (
+                    self.trading_mode == TradingMode.FUTURES
+                    and self.margin_mode == MarginMode.CROSS
+                ):
+                    settle = self._config["stake_currency"].lower()
+                    account = self._api.fetch2(
+                        "{settle}/accounts",
+                        ["private", "futures"],
+                        "GET",
+                        {"settle": settle},
+                    )
+                    self._log_exchange_response("fetch_cross_margin_account", account)
+                    try:
+                        account_margin_mode_raw = account.get("margin_mode")
+                    except AttributeError as exc:
+                        raise OperationalException(
+                            "Gate cross margin requires a futures account in classic or "
+                            "single-currency margin mode."
+                        ) from exc
+                    valid_margin_mode = (
+                        type(account_margin_mode_raw) is int and account_margin_mode_raw in (0, 3)
+                    ) or (
+                        type(account_margin_mode_raw) is str
+                        and account_margin_mode_raw in ("0", "3")
+                    )
+                    position_mode = account.get("position_mode")
+                    if not valid_margin_mode or position_mode not in (
+                        "single",
+                        "dual",
+                        "dual_plus",
+                    ):
+                        raise OperationalException(
+                            "Gate cross margin requires a classic or single-currency futures "
+                            "account with a supported position mode."
+                        )
+                    self.position_mode = position_mode
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
@@ -111,7 +151,30 @@ class Gate(Exchange):
         if ordertype == "market" and self.trading_mode == TradingMode.FUTURES:
             params["type"] = "market"
             params.update({"timeInForce": "IOC"})
+        if self.margin_mode == MarginMode.CROSS and self.position_mode == "dual_plus":
+            params["pos_margin_mode"] = "cross"
         return params
+
+    def _get_stop_params(self, side: BuySell, ordertype: str, stop_price: float) -> dict:
+        params = super()._get_stop_params(side, ordertype, stop_price)
+        if self.margin_mode == MarginMode.CROSS and self.position_mode == "dual_plus":
+            params["pos_margin_mode"] = "cross"
+        return params
+
+    def _lev_prep(
+        self,
+        pair: str,
+        leverage: float,
+        side: BuySell,
+        accept_fail: bool = False,
+    ) -> None:
+        if self.trading_mode != TradingMode.SPOT:
+            self._set_leverage(
+                leverage,
+                pair,
+                accept_fail,
+                params={"marginMode": self.margin_mode.value},
+            )
 
     @staticmethod
     def _chase_amount_to_string(amount: float) -> str:
@@ -120,6 +183,11 @@ class Gate(Exchange):
     def _chase_market_params(self, pair: str) -> tuple[str, str]:
         market = self.markets[pair]
         return market["id"], market["settle"].lower()
+
+    def _is_valid_liquidation_price(self, liquidation_price: float | None) -> bool:
+        if liquidation_price is None or not super()._is_valid_liquidation_price(liquidation_price):
+            return False
+        return float(liquidation_price) < 99_999_999.0
 
     def create_chase_order(
         self,
@@ -139,6 +207,8 @@ class Gate(Exchange):
             "reduce_only": bool(params.get("reduceOnly", False)),
             "price_type": 1,
         }
+        if self.margin_mode == MarginMode.CROSS and self.position_mode == "dual_plus":
+            request["pos_margin_mode"] = "cross"
         response = self._api.fetch2(
             "{settle}/autoorder/v1/chase/create", ["private", "futures"], "POST", request
         )
@@ -168,9 +238,9 @@ class Gate(Exchange):
         filled = abs(float(item.get("fill_amount") or 0.0))
         remaining = max(amount - filled, 0.0)
         average_raw = item.get("average_fill_price")
-        average = float(average_raw) if average_raw not in (None, "") else None
+        average = None if average_raw is None or average_raw == "" else float(average_raw)
         price_raw = item.get("suborder_price")
-        price = float(price_raw) if price_raw not in (None, "") else average
+        price = average if price_raw is None or price_raw == "" else float(price_raw)
         raw_status = str(item.get("status") or "").lower()
         status_code = item.get("status_code")
         failure = bool(item.get("error_label")) or status_code not in (None, "", "0", 0)

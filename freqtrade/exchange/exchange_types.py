@@ -9,6 +9,8 @@ from freqtrade.enums import CandleType
 class FtHas(TypedDict, total=False):
     order_time_in_force: list[str]
     chase_order: bool
+    cross_margin_stake_currencies: list[str]
+    cross_liquidation_price_fallback: bool
     exchange_has_overrides: dict[str, bool]
     marketOrderRequiresPrice: bool
 

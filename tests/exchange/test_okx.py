@@ -5,7 +5,12 @@ import ccxt
 import pytest
 
 from freqtrade.enums import CandleType, MarginMode, TradingMode
-from freqtrade.exceptions import InvalidOrderException, RetryableOrderError, TemporaryError
+from freqtrade.exceptions import (
+    InvalidOrderException,
+    OperationalException,
+    RetryableOrderError,
+    TemporaryError,
+)
 from freqtrade.exchange.common import API_RETRY_COUNT
 from freqtrade.exchange.exchange import timeframe_to_minutes
 from tests.conftest import EXMS, get_patched_exchange, log_has
@@ -297,6 +302,50 @@ def test_additional_exchange_init_okx(default_conf, mocker):
     )
 
 
+@pytest.mark.parametrize(
+    "accounts,net_only",
+    [
+        ([{"info": {"acctLv": "2", "posMode": "net_mode"}}], True),
+        ([{"info": {"acctLv": "2", "posMode": "long_short_mode"}}], False),
+    ],
+)
+def test_additional_exchange_init_okx_cross_account(default_conf, mocker, accounts, net_only):
+    api_mock = MagicMock()
+    api_mock.fetch_accounts.return_value = accounts
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    exchange.additional_exchange_init()
+
+    assert exchange.net_only is net_only
+    api_mock.fetch_accounts.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "accounts",
+    [
+        [{"info": {"acctLv": "3", "posMode": "net_mode"}}],
+        [{"info": {"acctLv": "4", "posMode": "net_mode"}}],
+        [{"info": {"posMode": "net_mode"}}],
+        [{"info": {"acctLv": "2"}}],
+        [{"info": {"acctLv": "2", "posMode": "invalid"}}],
+        [],
+    ],
+)
+def test_additional_exchange_init_okx_cross_rejects_account_level(default_conf, mocker, accounts):
+    api_mock = MagicMock()
+    api_mock.fetch_accounts.return_value = accounts
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    with pytest.raises(OperationalException, match="cross margin requires OKX account level 2"):
+        exchange.additional_exchange_init()
+
+
 def test_load_leverage_tiers_okx(default_conf, mocker, markets, tmp_path, caplog, time_machine):
     default_conf["datadir"] = tmp_path
     # fd_mock = mocker.patch('freqtrade.exchange.exchange.file_dump_json')
@@ -513,22 +562,24 @@ def test_load_leverage_tiers_okx(default_conf, mocker, markets, tmp_path, caplog
     assert log_has(logmsg, caplog)
 
 
-def test__set_leverage_okx(mocker, default_conf):
+@pytest.mark.parametrize("margin_mode", [MarginMode.ISOLATED, MarginMode.CROSS])
+def test__set_leverage_okx(mocker, default_conf, margin_mode):
     api_mock = MagicMock()
     api_mock.set_leverage = MagicMock()
     type(api_mock).has = PropertyMock(return_value={"setLeverage": True})
-    default_conf["dry_run"] = False
+    default_conf["dry_run"] = True
     default_conf["trading_mode"] = TradingMode.FUTURES
-    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["margin_mode"] = margin_mode
 
     exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange="okx")
+    exchange._config["dry_run"] = False
     exchange._lev_prep("BTC/USDT:USDT", 3.2, "buy")
     assert api_mock.set_leverage.call_count == 1
     # Leverage is rounded to 3.
     assert api_mock.set_leverage.call_args_list[0][1]["leverage"] == 3.2
     assert api_mock.set_leverage.call_args_list[0][1]["symbol"] == "BTC/USDT:USDT"
     assert api_mock.set_leverage.call_args_list[0][1]["params"] == {
-        "mgnMode": "isolated",
+        "mgnMode": margin_mode.value,
         "posSide": "net",
     }
     api_mock.set_leverage = MagicMock(side_effect=ccxt.NetworkError())
@@ -536,6 +587,7 @@ def test__set_leverage_okx(mocker, default_conf):
     assert api_mock.fetch_leverage.call_count == 1
 
     api_mock.fetch_leverage = MagicMock(side_effect=ccxt.NetworkError())
+    api_mock.fetch_accounts.return_value = [{"info": {"acctLv": "2", "posMode": "net_mode"}}]
     ccxt_exceptionhandlers(
         mocker,
         default_conf,
@@ -769,12 +821,13 @@ def test_fetch_orders_okx(default_conf, mocker, limit_order):
         (False, "buy", True, "short"),
     ],
 )
+@pytest.mark.parametrize("margin_mode", [MarginMode.ISOLATED, MarginMode.CROSS])
 def test_create_chase_order_okx(
-    default_conf, mocker, markets, net_only, side, reduce_only, position_side
+    default_conf, mocker, markets, net_only, side, reduce_only, position_side, margin_mode
 ):
-    default_conf["dry_run"] = False
+    default_conf["dry_run"] = True
     default_conf["trading_mode"] = TradingMode.FUTURES
-    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["margin_mode"] = margin_mode
     market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
     api_mock = MagicMock()
     api_mock.private_post_trade_order_algo.return_value = {
@@ -789,6 +842,7 @@ def test_create_chase_order_okx(
         exchange="okx",
         mock_markets={"ETH/USDT:USDT": market},
     )
+    exchange._config["dry_run"] = False
     exchange.net_only = net_only
     mocker.patch.object(exchange, "_lev_prep")
 
@@ -804,7 +858,7 @@ def test_create_chase_order_okx(
 
     expected_request = {
         "instId": "ETH-USDT-SWAP",
-        "tdMode": "isolated",
+        "tdMode": margin_mode.value,
         "side": side,
         "posSide": position_side,
         "ordType": "chase",

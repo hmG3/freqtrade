@@ -816,11 +816,7 @@ class Backtesting:
                 current_time=current_date,
             )
 
-            if self.margin_mode == MarginMode.CROSS or not (
-                order.ft_order_side == trade.exit_side and order.safe_amount == trade.amount
-            ):
-                # trade is still open or we are in cross margin mode and
-                # must update all liquidation prices
+            if order.ft_order_side == trade.entry_side:
                 update_liquidation_prices(
                     trade,
                     exchange=self.exchange,
@@ -848,6 +844,14 @@ class Backtesting:
                 trade.close(order.ft_price, show_msg=False)
 
                 LocalTrade.close_bt_trade(trade)
+            if self.margin_mode == MarginMode.CROSS or sub_trade:
+                update_liquidation_prices(
+                    trade,
+                    exchange=self.exchange,
+                    wallets=self.wallets,
+                    stake_currency=self.config["stake_currency"],
+                    dry_run=True,
+                )
             self.wallets.update()
             self.run_protections(pair, current_time, trade.trade_direction)
 

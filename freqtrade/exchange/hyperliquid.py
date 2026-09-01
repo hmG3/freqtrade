@@ -236,6 +236,7 @@ class Hyperliquid(Exchange):
         leverage: float,
         wallet_balance: float,  # Or margin balance
         open_trades: list,
+        mark_prices: dict[str, dict] | None = None,
     ) -> float | None:
         """
         Optimized

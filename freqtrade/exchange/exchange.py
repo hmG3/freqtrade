@@ -161,6 +161,8 @@ class Exchange:
         "ccxt_futures_name": "swap",
         "needs_trading_fees": False,  # use fetch_trading_fees to cache fees
         "balance_includes_unrealized_pnl": False,  # ccxt "total" is plain wallet balance
+        "cross_margin_stake_currencies": [],
+        "cross_liquidation_price_fallback": False,
         "order_props_in_contracts": ["amount", "filled", "remaining"],
         "fetch_orders_limit_minutes": None,  # "fetch_orders" is not time-limited by default
         # Override createMarketBuyOrderRequiresPrice where ccxt has it wrong
@@ -763,6 +765,13 @@ class Exchange:
                 "Could not load markets, therefore cannot start. "
                 "Please investigate the above error for more details."
             )
+        if self.trading_mode == TradingMode.FUTURES and self.margin_mode == MarginMode.CROSS:
+            supported = self.get_option("cross_margin_stake_currencies", [])
+            if supported and stake_currency not in supported:
+                raise ConfigurationError(
+                    f"Cross margin on {self.name} does not support stake currency "
+                    f"{stake_currency}. Supported currencies: {', '.join(supported)}."
+                )
         quote_currencies = self.get_quote_currencies()
         if stake_currency not in quote_currencies:
             raise ConfigurationError(
@@ -825,7 +834,7 @@ class Exchange:
             if (
                 not self._ft_has.get("chase_order", False)
                 or self.trading_mode != TradingMode.FUTURES
-                or self.margin_mode != MarginMode.ISOLATED
+                or self.margin_mode not in (MarginMode.ISOLATED, MarginMode.CROSS)
             ):
                 raise ConfigurationError(f"Exchange {self.name} does not support chase orders.")
             order_time_in_force = self._config.get("order_time_in_force", {})
@@ -2247,6 +2256,24 @@ class Exchange:
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
             raise TemporaryError(
                 f"Could not get funding rate due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def fetch_mark_prices(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        """Fetch normalized mark prices in one public API call."""
+        try:
+            if self.exchange_has("fetchMarkPrices"):
+                return self._api.fetch_mark_prices(symbols)
+            return self._api.fetch_funding_rates(symbols)
+        except ccxt.NotSupported as e:
+            raise OperationalException(f"{self.name} does not provide batch mark prices.") from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not fetch mark prices due to {e.__class__.__name__}. Message: {e}"
             ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
@@ -3864,6 +3891,7 @@ class Exchange:
         leverage: float,
         pair: str | None = None,
         accept_fail: bool = False,
+        params: dict | None = None,
     ):
         """
         Set's the leverage before making a trade, in order to not
@@ -3876,7 +3904,10 @@ class Exchange:
             # Rounding for binance ...
             leverage = floor(leverage)
         try:
-            res = self._api.set_leverage(symbol=pair, leverage=leverage)
+            if params:
+                res = self._api.set_leverage(symbol=pair, leverage=leverage, params=params)
+            else:
+                res = self._api.set_leverage(symbol=pair, leverage=leverage)
             self._log_exchange_response("set_leverage", res)
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
@@ -4127,6 +4158,12 @@ class Exchange:
 
         return 0.0
 
+    def _is_valid_liquidation_price(self, liquidation_price: float | None) -> bool:
+        try:
+            return liquidation_price is not None and float(liquidation_price) > 0.0
+        except (TypeError, ValueError):
+            return False
+
     def get_liquidation_price(
         self,
         pair: str,
@@ -4138,6 +4175,7 @@ class Exchange:
         leverage: float,
         wallet_balance: float,
         open_trades: list | None = None,
+        mark_prices: dict[str, dict] | None = None,
     ) -> float | None:
         """
         Set's the margin mode on the exchange to cross or isolated for a specific pair
@@ -4151,6 +4189,9 @@ class Exchange:
 
         liquidation_price = None
         if self._config["dry_run"] or not self.exchange_has("fetchPositions"):
+            dry_kwargs: dict[str, Any] = {}
+            if self.get_option("cross_liquidation_price_fallback", False):
+                dry_kwargs["mark_prices"] = mark_prices
             liquidation_price = self.dry_run_liquidation_price(
                 pair=pair,
                 open_rate=open_rate,
@@ -4160,12 +4201,17 @@ class Exchange:
                 stake_amount=stake_amount,
                 wallet_balance=wallet_balance,
                 open_trades=open_trades or [],
+                **dry_kwargs,
             )
         else:
             positions = self.fetch_positions(pair)
             if len(positions) > 0:
                 pos = positions[0]
-                liquidation_price = pos["liquidationPrice"]
+                position_liquidation_price = pos["liquidationPrice"]
+                if position_liquidation_price is not None and self._is_valid_liquidation_price(
+                    position_liquidation_price
+                ):
+                    liquidation_price = float(position_liquidation_price)
 
         if liquidation_price is not None:
             buffer_amount = abs(open_rate - liquidation_price) * self.liquidation_buffer
@@ -4186,6 +4232,7 @@ class Exchange:
         leverage: float,
         wallet_balance: float,
         open_trades: list,
+        mark_prices: dict[str, dict] | None = None,
     ) -> float | None:
         """
         Important: Must be fetching data from cached values as this is used by backtesting!
@@ -4212,16 +4259,18 @@ class Exchange:
         """
 
         market = self.markets[pair]
+        if self.trading_mode == TradingMode.FUTURES and market["inverse"]:
+            raise OperationalException("Freqtrade does not yet support inverse contracts")
         # default to some default fee if not available from exchange
         taker_fee_rate = market["taker"] or self._api.describe().get("fees", {}).get(
             "trading", {}
         ).get("taker", 0.001)
-        mm_ratio, _ = self.get_maintenance_ratio_and_amt(pair, stake_amount)
+        target_notional = (
+            amount * open_rate if self.margin_mode == MarginMode.CROSS else stake_amount
+        )
+        mm_ratio, maintenance_amt = self.get_maintenance_ratio_and_amt(pair, target_notional)
 
         if self.trading_mode == TradingMode.FUTURES and self.margin_mode == MarginMode.ISOLATED:
-            if market["inverse"]:
-                raise OperationalException("Freqtrade does not yet support inverse contracts")
-
             value = wallet_balance / amount
 
             mm_ratio_taker = mm_ratio + taker_fee_rate
@@ -4229,9 +4278,51 @@ class Exchange:
                 return (open_rate + value) / (1 + mm_ratio_taker)
             else:
                 return (open_rate - value) / (1 - mm_ratio_taker)
+        elif self.trading_mode == TradingMode.FUTURES and self.margin_mode == MarginMode.CROSS:
+            use_mark_prices = self._config.get("runmode") in (RunMode.LIVE, RunMode.DRY_RUN)
+            other_pairs = list({trade.pair for trade in open_trades if trade.pair != pair})
+            if use_mark_prices and mark_prices is None and other_pairs:
+                mark_prices = self.fetch_mark_prices(other_pairs)
+
+            cross_vars = 0.0
+            for trade in open_trades:
+                if trade.pair == pair:
+                    continue
+                other_market = self.markets[trade.pair]
+                if other_market["inverse"]:
+                    raise OperationalException("Freqtrade does not yet support inverse contracts")
+                if use_mark_prices:
+                    mark_price = (mark_prices or {}).get(trade.pair, {}).get("markPrice")
+                    if mark_price is None:
+                        raise OperationalException(
+                            f"Mark price for {trade.pair} is required for cross liquidation."
+                        )
+                    mark_price = float(mark_price)
+                else:
+                    mark_price = trade.open_rate
+
+                other_notional = trade.amount * mark_price
+                other_mm_ratio, other_maintenance_amt = self.get_maintenance_ratio_and_amt(
+                    trade.pair, other_notional
+                )
+                other_taker_fee = other_market["taker"] or self._api.describe().get("fees", {}).get(
+                    "trading", {}
+                ).get("taker", 0.001)
+                other_maintenance = other_notional * (other_mm_ratio + other_taker_fee) - (
+                    other_maintenance_amt or 0.0
+                )
+                direction = -1 if trade.is_short else 1
+                other_upnl = direction * trade.amount * (mark_price - trade.open_rate)
+                cross_vars += other_upnl - other_maintenance
+
+            side = -1 if is_short else 1
+            return (
+                wallet_balance + cross_vars + (maintenance_amt or 0.0) - side * amount * open_rate
+            ) / (amount * (mm_ratio + taker_fee_rate - side))
         else:
             raise OperationalException(
-                "Freqtrade only supports isolated futures for leverage trading"
+                f"Freqtrade does not support {self.margin_mode} {self.trading_mode} "
+                "liquidation calculations on this exchange."
             )
 
     def get_maintenance_ratio_and_amt(

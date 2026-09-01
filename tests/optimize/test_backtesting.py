@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, PropertyMock
+from unittest.mock import call as mock_call
 
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ from freqtrade.data.btanalysis import BT_DATA_COLUMNS, evaluate_result_multi
 from freqtrade.data.converter import clean_ohlcv_dataframe, ohlcv_fill_up_missing_data
 from freqtrade.data.dataprovider import DataProvider
 from freqtrade.data.history import get_timerange
-from freqtrade.enums import CandleType, ExitType, RunMode
+from freqtrade.enums import CandleType, ExitType, MarginMode, RunMode
 from freqtrade.exceptions import DependencyException, OperationalException
 from freqtrade.exchange import timeframe_to_next_date, timeframe_to_prev_date
 from freqtrade.exchange.exchange_utils import DECIMAL_PLACES, TICK_SIZE
@@ -960,6 +961,39 @@ def test_backtest_one(default_conf, mocker, testdatadir) -> None:
     unique_currencies = wallet_summary["currency"].value_counts()
     assert unique_currencies["BTC"] == 200
     assert unique_currencies["UNITTEST"] == 55
+
+
+def test_cross_exit_recalculates_trade_before_liquidation_update(mocker):
+    backtesting = MagicMock()
+    backtesting.margin_mode = MarginMode.CROSS
+    backtesting.config = {"stake_currency": "USDT"}
+    backtesting._try_close_open_order.return_value = True
+    order = MagicMock(safe_amount_after_fee=0.5, ft_price=100.0)
+    trade = MagicMock(amount=1.0, trade_direction="long")
+    update_liquidation = mocker.patch("freqtrade.optimize.backtesting.update_liquidation_prices")
+    events = MagicMock()
+    events.attach_mock(trade.recalc_trade_from_orders, "recalculate")
+    events.attach_mock(update_liquidation, "update_liquidation")
+
+    Backtesting._process_exit_order(
+        backtesting,
+        order,
+        trade,
+        dt_utc(2026, 8, 8),
+        (),
+        "ETH/USDT:USDT",
+    )
+
+    assert events.mock_calls == [
+        mock_call.recalculate(),
+        mock_call.update_liquidation(
+            trade,
+            exchange=backtesting.exchange,
+            wallets=backtesting.wallets,
+            stake_currency="USDT",
+            dry_run=True,
+        ),
+    ]
 
 
 @pytest.mark.parametrize("use_detail", [True, False])

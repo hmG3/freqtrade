@@ -4,7 +4,8 @@ import re
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from random import randint
-from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, PropertyMock, call, patch
 
 import ccxt
 import pytest
@@ -1046,9 +1047,10 @@ def test_validate_order_types_not_in_config(default_conf, mocker):
 
 
 @pytest.mark.parametrize("exchange_name", ["okx", "gate"])
-def test_validate_chase_order_type(default_conf, mocker, exchange_name):
+@pytest.mark.parametrize("margin_mode", [MarginMode.ISOLATED, MarginMode.CROSS])
+def test_validate_chase_order_type(default_conf, mocker, exchange_name, margin_mode):
     default_conf["trading_mode"] = TradingMode.FUTURES
-    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["margin_mode"] = margin_mode
     default_conf["order_types"] = {
         "entry": "chase",
         "exit": "limit",
@@ -1084,8 +1086,6 @@ def test_validate_chase_order_type_rejects_unsupported_exchange(default_conf, mo
     [
         ("okx", TradingMode.SPOT, MarginMode.NONE),
         ("gate", TradingMode.SPOT, MarginMode.NONE),
-        ("okx", TradingMode.FUTURES, MarginMode.CROSS),
-        ("gate", TradingMode.FUTURES, MarginMode.CROSS),
     ],
 )
 def test_validate_chase_order_type_rejects_unsupported_mode_or_adapter(
@@ -1109,6 +1109,29 @@ def test_validate_chase_order_type_rejects_unsupported_mode_or_adapter(
 @pytest.mark.parametrize("exchange_class", [Myokx, Okxus, GateEU])
 def test_regional_exchange_adapters_do_not_advertise_chase(exchange_class):
     assert not exchange_class.combine_ft_has(include_futures=True).get("chase_order", False)
+
+
+@pytest.mark.parametrize("exchange_class", [Myokx, Okxus, GateEU])
+def test_regional_exchange_adapters_do_not_support_cross_futures(exchange_class):
+    assert (TradingMode.FUTURES, MarginMode.CROSS) not in (
+        exchange_class._supported_trading_mode_margin_pairs
+    )
+
+
+@pytest.mark.parametrize("exchange_name", ["okx", "gate"])
+def test_cross_margin_rejects_unsupported_stake_currency(default_conf, mocker, exchange_name):
+    exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+    exchange._ft_has = exchange.combine_ft_has(include_futures=True)
+    exchange._markets = {"ETH/USDC:USDC": {"quote": "USDC"}}
+    mocker.patch.object(exchange, "get_quote_currencies", return_value=["USDC", "USDT"])
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"Cross margin on .* does not support stake currency USDC.*USDT",
+    ):
+        exchange.validate_stakecurrency("USDC")
 
 
 def test_validate_required_startup_candles(default_conf, mocker, caplog):
@@ -1708,7 +1731,7 @@ def test_create_order(default_conf, mocker, side, ordertype, rate, marketprice, 
 
     if exchange_name != "okx":
         assert exchange._set_leverage.call_count == 1
-        assert exchange.set_margin_mode.call_count == 1
+        assert exchange.set_margin_mode.call_count == (0 if exchange_name == "gate" else 1)
     else:
         assert api_mock.set_leverage.call_count == 1
     assert order["amount"] == 0.01
@@ -5676,6 +5699,28 @@ def test_set_margin_mode(mocker, default_conf, margin_mode, caplog):
     assert log_has_re(r"Margin mode already set for XRP/USDT\..*", caplog)
 
 
+def test_set_leverage_forwards_optional_params(mocker, default_conf):
+    api_mock = MagicMock()
+    type(api_mock).has = PropertyMock(return_value={"setLeverage": True})
+    exchange = get_patched_exchange(mocker, default_conf, api_mock=api_mock)
+    exchange._config["dry_run"] = False
+
+    exchange._set_leverage(3.0, "ETH/USDT:USDT")
+    api_mock.set_leverage.assert_called_once_with(symbol="ETH/USDT:USDT", leverage=3.0)
+
+    api_mock.set_leverage.reset_mock()
+    exchange._set_leverage(
+        3.0,
+        "ETH/USDT:USDT",
+        params={"marginMode": "cross"},
+    )
+    api_mock.set_leverage.assert_called_once_with(
+        symbol="ETH/USDT:USDT",
+        leverage=3.0,
+        params={"marginMode": "cross"},
+    )
+
+
 @pytest.mark.parametrize(
     "exchange_name, trading_mode, margin_mode, allow_none_margin_mode, exception_thrown",
     [
@@ -5688,7 +5733,7 @@ def test_set_margin_mode(mocker, default_conf, margin_mode, caplog):
         ("okx", TradingMode.SPOT, None, False, False),
         ("okx", TradingMode.MARGIN, MarginMode.CROSS, False, True),
         ("okx", TradingMode.MARGIN, MarginMode.ISOLATED, False, True),
-        ("okx", TradingMode.FUTURES, MarginMode.CROSS, False, True),
+        ("okx", TradingMode.FUTURES, MarginMode.CROSS, False, False),
         ("binance", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
         ("gate", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
         ("okx", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
@@ -5701,14 +5746,13 @@ def test_set_margin_mode(mocker, default_conf, margin_mode, caplog):
         ("kraken", TradingMode.MARGIN, MarginMode.CROSS, False, True),
         ("kraken", TradingMode.FUTURES, MarginMode.CROSS, False, True),
         ("gate", TradingMode.MARGIN, MarginMode.CROSS, False, True),
-        ("gate", TradingMode.FUTURES, MarginMode.CROSS, False, True),
+        ("gate", TradingMode.FUTURES, MarginMode.CROSS, False, False),
         # * Uncomment once implemented
         # ("binance", TradingMode.MARGIN, MarginMode.CROSS, False, False),
         # ("binance", TradingMode.FUTURES, MarginMode.CROSS, False, False),
         # ("kraken", TradingMode.MARGIN, MarginMode.CROSS, False, False),
         # ("kraken", TradingMode.FUTURES, MarginMode.CROSS, False, False),
         # ("gate", TradingMode.MARGIN, MarginMode.CROSS, False, False),
-        # ("gate", TradingMode.FUTURES, MarginMode.CROSS, False, False),
     ],
 )
 def test_validate_trading_mode_and_margin_mode(
@@ -6945,6 +6989,11 @@ def test_get_liquidation_price1(mocker, default_conf):
         (False, "futures", "gate", "isolated", 5.0, 10.0, 1.0, (0.01, 0.01), 8.085708510208207),
         (False, "futures", "gate", "isolated", 3.0, 10.0, 1.0, (0.01, 0.01), 6.738090425173506),
         (False, "futures", "okx", "isolated", 3.0, 10.0, 1.0, (0.01, 0.01), 6.738090425173506),
+        # Gate/okx, cross without other positions
+        (True, "futures", "gate", "cross", 5.0, 10.0, 1.0, (0.01, 0.01), 11.884029289530972),
+        (False, "futures", "gate", "cross", 5.0, 10.0, 1.0, (0.01, 0.01), 8.075601374570448),
+        (True, "futures", "okx", "cross", 5.0, 10.0, 1.0, (0.01, 0.01), 11.884029289530972),
+        (False, "futures", "okx", "cross", 5.0, 10.0, 1.0, (0.01, 0.01), 8.075601374570448),
         # bybit, long
         (False, "futures", "bybit", "isolated", 1.0, 10.0, 1.0, (0.01, 0.01), 0.1),
         (False, "futures", "bybit", "isolated", 3.0, 10.0, 1.0, (0.01, 0.01), 6.7666666),
@@ -7055,6 +7104,247 @@ def test_get_liquidation_price(
         buffer_amount = liquidation_buffer * abs(open_rate - expected_liq)
         expected_liq = expected_liq - buffer_amount if is_short else expected_liq + buffer_amount
         assert pytest.approx(expected_liq) == liq
+
+
+@pytest.mark.parametrize("native_mark_prices", [True, False])
+def test_fetch_mark_prices_uses_supported_batch_endpoint(mocker, default_conf, native_mark_prices):
+    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+    mark_prices = {
+        symbols[0]: {"symbol": symbols[0], "markPrice": 60_000.0},
+        symbols[1]: {"symbol": symbols[1], "markPrice": 3_000.0},
+    }
+    api_mock = MagicMock()
+    type(api_mock).has = PropertyMock(return_value={"fetchMarkPrices": native_mark_prices})
+    if native_mark_prices:
+        api_mock.fetch_mark_prices.return_value = mark_prices
+    else:
+        api_mock.fetch_funding_rates.return_value = mark_prices
+    exchange = get_patched_exchange(mocker, default_conf, api_mock=api_mock)
+
+    assert exchange.fetch_mark_prices(symbols) == mark_prices
+    if native_mark_prices:
+        api_mock.fetch_mark_prices.assert_called_once_with(symbols)
+        api_mock.fetch_funding_rates.assert_not_called()
+    else:
+        api_mock.fetch_funding_rates.assert_called_once_with(symbols)
+        api_mock.fetch_mark_prices.assert_not_called()
+
+
+def test_fetch_mark_prices_exception_mapping(mocker, default_conf):
+    symbols = ["BTC/USDT:USDT"]
+    api_mock = MagicMock()
+    type(api_mock).has = PropertyMock(return_value={"fetchMarkPrices": True})
+
+    ccxt_exceptionhandlers(
+        mocker,
+        default_conf,
+        api_mock,
+        "binance",
+        "fetch_mark_prices",
+        "fetch_mark_prices",
+        symbols=symbols,
+    )
+
+    api_mock.fetch_mark_prices = MagicMock(side_effect=ccxt.NotSupported("unsupported"))
+    exchange = get_patched_exchange(mocker, default_conf, api_mock=api_mock)
+    with pytest.raises(OperationalException, match="does not provide batch mark prices"):
+        exchange.fetch_mark_prices(symbols)
+
+
+@pytest.mark.parametrize("is_short", [False, True])
+@pytest.mark.parametrize("other_is_short", [False, True])
+@pytest.mark.parametrize(
+    "runmode,valuation_price",
+    [
+        (RunMode.DRY_RUN, 21.0),
+        (RunMode.BACKTEST, 20.0),
+        (RunMode.HYPEROPT, 20.0),
+    ],
+)
+def test_dry_run_cross_liquidation_includes_other_positions(
+    mocker,
+    default_conf_usdt,
+    markets,
+    is_short,
+    other_is_short,
+    runmode,
+    valuation_price,
+):
+    target_pair = "ETH/USDT:USDT"
+    other_pair = "ADA/USDT:USDT"
+    default_conf_usdt["trading_mode"] = TradingMode.FUTURES
+    default_conf_usdt["margin_mode"] = MarginMode.CROSS
+    default_conf_usdt["liquidation_buffer"] = 0.0
+    default_conf_usdt["runmode"] = runmode
+    custom_markets = {
+        target_pair: markets[target_pair] | {"inverse": False, "taker": 0.001},
+        other_pair: markets[other_pair] | {"inverse": False, "taker": 0.001},
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf_usdt,
+        exchange="gate",
+        mock_markets=custom_markets,
+    )
+    exchange.get_maintenance_ratio_and_amt = MagicMock(return_value=(0.01, 0.0))
+    other_trade = SimpleNamespace(
+        pair=other_pair,
+        amount=10.0,
+        open_rate=20.0,
+        is_short=other_is_short,
+    )
+    mark_prices = {other_pair: {"markPrice": 21.0}}
+
+    result = exchange.dry_run_liquidation_price(
+        pair=target_pair,
+        open_rate=100.0,
+        is_short=is_short,
+        amount=1.0,
+        stake_amount=20.0,
+        leverage=5.0,
+        wallet_balance=20.0,
+        open_trades=[other_trade],
+        mark_prices=mark_prices,
+    )
+
+    other_direction = -1 if other_is_short else 1
+    other_upnl = other_direction * 10.0 * (valuation_price - 20.0)
+    other_maintenance = 10.0 * valuation_price * (0.01 + 0.001)
+    side = -1 if is_short else 1
+    expected = (20.0 + other_upnl - other_maintenance - side * 1.0 * 100.0) / (
+        1.0 * (0.01 + 0.001 - side)
+    )
+    assert result == pytest.approx(expected)
+    exchange.get_maintenance_ratio_and_amt.assert_has_calls(
+        [call(target_pair, 100.0), call(other_pair, 10.0 * valuation_price)]
+    )
+
+
+def test_dry_run_cross_liquidation_uses_maintenance_amounts_and_default_fee(
+    mocker, default_conf_usdt, markets
+):
+    target_pair = "ETH/USDT:USDT"
+    other_pair = "ADA/USDT:USDT"
+    default_conf_usdt["trading_mode"] = TradingMode.FUTURES
+    default_conf_usdt["margin_mode"] = MarginMode.CROSS
+    default_conf_usdt["runmode"] = RunMode.BACKTEST
+    custom_markets = {
+        target_pair: markets[target_pair] | {"inverse": False, "taker": 0.001},
+        other_pair: markets[other_pair] | {"inverse": False, "taker": None},
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf_usdt,
+        exchange="gate",
+        mock_markets=custom_markets,
+    )
+    exchange._api.describe.return_value = {"fees": {"trading": {"taker": 0.002}}}
+    exchange.get_maintenance_ratio_and_amt = MagicMock(side_effect=[(0.01, 1.5), (0.02, 0.5)])
+    other_trade = SimpleNamespace(
+        pair=other_pair,
+        amount=10.0,
+        open_rate=20.0,
+        is_short=True,
+    )
+
+    result = exchange.dry_run_liquidation_price(
+        pair=target_pair,
+        open_rate=100.0,
+        is_short=False,
+        amount=2.0,
+        stake_amount=40.0,
+        leverage=5.0,
+        wallet_balance=100.0,
+        open_trades=[other_trade],
+    )
+
+    other_maintenance = 200.0 * (0.02 + 0.002) - 0.5
+    expected = (100.0 - other_maintenance + 1.5 - 200.0) / (2.0 * (0.01 + 0.001 - 1.0))
+    assert result == pytest.approx(expected)
+    exchange.get_maintenance_ratio_and_amt.assert_has_calls(
+        [call(target_pair, 200.0), call(other_pair, 200.0)]
+    )
+
+
+def test_dry_run_cross_liquidation_rejects_inverse_market(mocker, default_conf_usdt, markets):
+    pair = "ETH/USDT:USDT"
+    default_conf_usdt["trading_mode"] = TradingMode.FUTURES
+    default_conf_usdt["margin_mode"] = MarginMode.CROSS
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf_usdt,
+        exchange="gate",
+        mock_markets={pair: markets[pair] | {"inverse": True}},
+    )
+
+    with pytest.raises(OperationalException, match="inverse contracts"):
+        exchange.dry_run_liquidation_price(
+            pair=pair,
+            open_rate=100.0,
+            is_short=False,
+            amount=1.0,
+            stake_amount=20.0,
+            leverage=5.0,
+            wallet_balance=20.0,
+            open_trades=[],
+            mark_prices={},
+        )
+
+
+def test_get_liquidation_price_passes_mark_snapshot_to_dry_calculation(mocker, default_conf_usdt):
+    default_conf_usdt["trading_mode"] = TradingMode.FUTURES
+    default_conf_usdt["margin_mode"] = MarginMode.CROSS
+    default_conf_usdt["liquidation_buffer"] = 0.0
+    exchange = get_patched_exchange(mocker, default_conf_usdt, exchange="gate")
+    dry_liquidation = mocker.patch.object(exchange, "dry_run_liquidation_price", return_value=75.0)
+    mark_prices = {"ETH/USDT:USDT": {"markPrice": 100.0}}
+
+    result = exchange.get_liquidation_price(
+        pair="ETH/USDT:USDT",
+        open_rate=100.0,
+        is_short=False,
+        amount=1.0,
+        stake_amount=20.0,
+        leverage=5.0,
+        wallet_balance=20.0,
+        open_trades=[],
+        mark_prices=mark_prices,
+    )
+
+    assert result == 75.0
+    assert dry_liquidation.call_args.kwargs["mark_prices"] is mark_prices
+
+
+@pytest.mark.parametrize("liquidation_price", [None, 0.0, 99_999_999.0])
+def test_gate_live_cross_does_not_estimate_missing_liquidation_price(
+    mocker, default_conf_usdt, liquidation_price
+):
+    pair = "ETH/USDT:USDT"
+    api_mock = MagicMock()
+    type(api_mock).has = PropertyMock(return_value={"fetchPositions": True})
+    api_mock.fetch_positions.return_value = [
+        {"symbol": pair, "side": "long", "liquidationPrice": liquidation_price}
+    ]
+    exchange = get_patched_exchange(mocker, default_conf_usdt, exchange="gate", api_mock=api_mock)
+    exchange._config["dry_run"] = False
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+    exchange._ft_has = exchange.combine_ft_has(include_futures=True)
+    dry_liquidation = mocker.patch.object(exchange, "dry_run_liquidation_price")
+
+    result = exchange.get_liquidation_price(
+        pair=pair,
+        open_rate=100.0,
+        is_short=False,
+        amount=1.0,
+        stake_amount=20.0,
+        leverage=5.0,
+        wallet_balance=20.0,
+        open_trades=[],
+    )
+
+    assert result is None
+    dry_liquidation.assert_not_called()
 
 
 @pytest.mark.parametrize(
