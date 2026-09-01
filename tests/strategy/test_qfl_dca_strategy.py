@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pandas import DataFrame
 
+from freqtrade.enums import RunMode
 from freqtrade.persistence import Order, Trade
 from user_data.strategies.qfl_dca_strategy import QFLDCAStrategy
 
@@ -136,6 +137,41 @@ def test_custom_stake_reserves_complete_qfl_ladder_budget() -> None:
     assert stake == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ETH/USDT:USDT long 2026-01-01 00:00] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_custom_stake_logs_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
+    strategy = _strategy()
+    strategy.config["runmode"] = runmode
+
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.qfl_dca_strategy"):
+        stake = strategy.custom_stake_amount(
+            pair="ETH/USDT:USDT",
+            current_time=datetime(2026, 1, 1, tzinfo=UTC),
+            current_rate=100.0,
+            proposed_stake=150.0,
+            min_stake=None,
+            max_stake=150.0,
+            leverage=10.0,
+            entry_tag="📈-📍",
+            side="long",
+        )
+
+    assert stake == pytest.approx(10.0)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{expected_prefix}Initial stake requested | "
+        "10 USDT | DCA budget 150 USDT / multiplier 15"
+    ]
+
+
 def test_order_filled_uses_shared_initial_and_so_log_labels(monkeypatch, caplog) -> None:
     strategy = _strategy()
     initial_trade = _trade()
@@ -159,9 +195,9 @@ def test_order_filled_uses_shared_initial_and_so_log_labels(monkeypatch, caplog)
     )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert messages[0].startswith("Initial order filled | #91 ETH/USDT:USDT long")
+    assert messages[0].startswith("BO filled | ")
     assert "📈-📍" not in messages[0]
-    assert messages[1].startswith("SO filled | #91 ETH/USDT:USDT long")
+    assert messages[1].startswith("SO1 filled | ")
 
 
 def test_next_safety_order_is_not_requested_before_its_limit_is_reached(monkeypatch) -> None:
@@ -223,7 +259,7 @@ def test_next_safety_order_uses_exact_limit_after_close_reaches_level(
     assert adjustment[1] == "📈-🛡️⓵"
     assert data["qfl_next_safety_order_price"] == pytest.approx(99.5)
     assert next(record.getMessage() for record in caplog.records).startswith(
-        "SO requested | #91 ETH/USDT:USDT long"
+        "SO1 requested |"
     )
 
 
@@ -255,24 +291,39 @@ def test_resting_take_profit_does_not_block_next_safety_order(monkeypatch) -> No
     assert adjustment[1] == "📈-🛡️⓵"
 
 
-def test_take_profit_limit_is_requested_without_waiting_for_price_touch() -> None:
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ETH/USDT:USDT long 2026-01-01 01:00] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_take_profit_limit_log_has_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
     strategy = _strategy()
+    strategy.config["runmode"] = runmode
     trade = _trade()
     dataframe = _last_candle()
     strategy.dp = SimpleNamespace(
         get_analyzed_dataframe=lambda pair, timeframe: (dataframe, None),
     )
 
-    assert (
-        strategy.custom_exit(
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.qfl_dca_strategy"):
+        result = strategy.custom_exit(
             pair=trade.pair,
             trade=trade,
             current_time=dataframe["date"].iat[-1],
             current_rate=100.0,
             current_profit=0.0,
         )
-        == strategy.TAKE_PROFIT_EXIT_TAG
-    )
+
+    assert result == strategy.TAKE_PROFIT_EXIT_TAG
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{expected_prefix}TP limit requested | target 101.2022022"
+    ]
 
 
 def test_open_safety_order_is_not_replaced_by_take_profit() -> None:

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from pandas import DataFrame, Series, date_range
 
+from freqtrade.enums import RunMode
 from freqtrade.persistence import Order, Trade
 from user_data.strategies import adx_vw_dca_strategy as adx_module
 from user_data.strategies.adx_vw_dca_strategy import (
@@ -396,8 +397,20 @@ def test_long_and_short_tags_use_shared_prefix_suffix_combinations() -> None:
     assert result["enter_tag"].tolist() == ["📈-📍", "📉-📍", "📈-🔄", "📉-🔄"]
 
 
-def test_custom_stake_logs_geometric_dca_parts(caplog) -> None:
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ETH/USDT:USDT long 2026-01-01 00:00] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_custom_stake_logs_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
     strategy = _strategy()
+    strategy.config["runmode"] = runmode
     strategy.vol_scale.value = 1.5
     strategy.max_safe_orders.value = 5
 
@@ -416,7 +429,7 @@ def test_custom_stake_logs_geometric_dca_parts(caplog) -> None:
 
     assert stake == pytest.approx(10.0)
     assert [record.getMessage() for record in caplog.records] == [
-        "Initial stake requested | ETH/USDT:USDT long | 2026-01-01 00:00 | "
+        f"{expected_prefix}Initial stake requested | "
         "10 USDT | DCA budget 207.812 USDT ÷ DCA factor 20.78125 "
         "(∑ 1 + 1.5 + 2.25 + 3.375 + 5.0625 + 7.59375)"
     ]
@@ -593,7 +606,7 @@ def test_safety_order_skip_log_survives_trade_reload(monkeypatch, caplog) -> Non
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
-        "SO skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        "SO skipped | "
         "close 98.1 > trigger 98 | remaining 0.1 | "
         "trigger = last entry 100 - 2 x ATR 1"
     ]
@@ -946,7 +959,7 @@ def test_adjust_trade_position_logs_emergency_break_even_limit(caplog, monkeypat
     assert adjustment == (-trade.stake_amount, "🛟")
     assert [record.getMessage() for record in caplog.records] == [
         (
-            "Emergency BE | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+            "Emergency BE | "
             f"limit {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
         )
     ]
@@ -1037,7 +1050,7 @@ def test_take_profit_log_is_emitted_once_per_candle(caplog) -> None:
     messages = [record.getMessage() for record in caplog.records]
     tp_target_rate = break_even + 1.0
     assert messages == [
-        "TP skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        "TP skipped | "
         f"exit {strategy._format_log_number(break_even)} < "
         f"target {strategy._format_log_number(tp_target_rate)} | remaining 1 | "
         f"target = BE {strategy._format_log_number(break_even)} + 1 x ATR 1"

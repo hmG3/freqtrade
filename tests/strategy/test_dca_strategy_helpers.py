@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from freqtrade.enums import RunMode
+from user_data.strategies import dca_strategy_helpers as dca_helpers
 from user_data.strategies.adx_vw_dca_strategy import ADXVWDCAStrategy
 from user_data.strategies.dca_strategy_helpers import select_dca_leverage
 from user_data.strategies.qfl_dca_strategy import QFLDCAStrategy
@@ -20,6 +22,32 @@ LTC_TIERS = [
     {"minNotional": 18000.1, "maxNotional": 24000.0, "maxLeverage": 15.38},
     {"minNotional": 24000.1, "maxNotional": 30000.0, "maxLeverage": 14.28},
 ]
+
+
+@pytest.mark.parametrize(
+    ("contracts", "amount_decimals", "expected"),
+    [
+        (1.23456789, None, "1.235 contracts / 0.12346 ETH / 12.346 USDT"),
+        (1.23456789, 8, "1.23456789 contracts / 0.12345679 ETH / 12.346 USDT"),
+        (None, None, "N/A contracts / 0.12346 ETH / 12.346 USDT"),
+        (None, 8, "N/A contracts / 0.12345679 ETH / 12.346 USDT"),
+        (0.0, None, "0 contracts / 0.12346 ETH / 12.346 USDT"),
+    ],
+)
+def test_format_contract_amounts_preserves_precision_and_unknown_contracts(
+    contracts, amount_decimals, expected
+) -> None:
+    assert (
+        dca_helpers.format_contract_amounts(
+            contracts=contracts,
+            base_amount=0.123456789,
+            quote_notional=12.3456789,
+            base_currency="ETH",
+            quote_currency="USDT",
+            amount_decimals=amount_decimals,
+        )
+        == expected
+    )
 
 
 def test_select_dca_leverage_accounts_for_equal_hedge_and_buffer() -> None:
@@ -133,9 +161,7 @@ def test_dca_strategies_use_exposure_aware_leverage(strategy_class) -> None:
     pair = "LTC/USDT:USDT"
     strategy = strategy_class({"stake_currency": "USDT"})
     strategy.leverage_buffer_pct.value = 5.0
-    strategy.dp = SimpleNamespace(
-        _exchange=SimpleNamespace(_leverage_tiers={pair: LTC_TIERS})
-    )
+    strategy.dp = SimpleNamespace(_exchange=SimpleNamespace(_leverage_tiers={pair: LTC_TIERS}))
 
     leverage = strategy.leverage(
         pair=pair,
@@ -180,9 +206,20 @@ def test_dca_strategies_include_exchange_minimum_in_leverage_budget(strategy_cla
     assert leverage == 20.0
 
 
-def test_okx_contract_tier_capacity_is_converted_and_logged(caplog) -> None:
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ZEC/USDT:USDT short 2026-08-30 15:12] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_okx_contract_tier_log_has_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
     pair = "ZEC/USDT:USDT"
-    strategy = RSIMLDCAStrategy({"stake_currency": "USDT"})
+    strategy = RSIMLDCAStrategy({"stake_currency": "USDT", "runmode": runmode})
     strategy.leverage_buffer_pct.value = 5.0
     strategy.dp = SimpleNamespace(
         _exchange=SimpleNamespace(
@@ -218,10 +255,45 @@ def test_okx_contract_tier_capacity_is_converted_and_logged(caplog) -> None:
     assert leverage == 50.0
     assert [record.getMessage() for record in caplog.records] == [
         (
-            "Leverage selected | ZEC/USDT:USDT short | 2026-08-30 15:12 | 50x | "
+            f"{expected_prefix}Leverage selected | 50x | "
             "DCA 109.145 USDT + hedge 109.145 USDT | "
             "gross notional 10914.471 USDT | tier 1/1, usable "
-            "14250 contracts / 142.5 ZEC / 123690 USDT (5% buffer) | "
+            "130200 USDT - 5% buffer = "
+            "14250 contracts / 142.5 ZEC / 123690 USDT | "
             "utilization 8.82%"
         )
     ]
+
+
+def test_okx_capacity_log_preserves_eight_decimal_amount_precision(caplog, monkeypatch) -> None:
+    pair = "ETH/USDT:USDT"
+    strategy = RSIMLDCAStrategy({"stake_currency": "USDT"})
+    monkeypatch.setattr(strategy.leverage_buffer_pct, "value", 5.0)
+    strategy.dp = SimpleNamespace(
+        _exchange=SimpleNamespace(
+            id="okx",
+            _leverage_tiers={
+                pair: [{"minNotional": 0.0, "maxNotional": 10.12345678, "maxLeverage": 10.0}]
+            },
+            get_contract_size=lambda _: 0.1,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger=strategy.__module__):
+        leverage = strategy.leverage(
+            pair=pair,
+            current_time=datetime(2026, 8, 31, tzinfo=UTC),
+            current_rate=100.0,
+            proposed_leverage=1.0,
+            max_leverage=10.0,
+            entry_tag=None,
+            side="long",
+            proposed_stake=1.0,
+        )
+
+    assert leverage == 10.0
+    assert len(caplog.messages) == 1
+    assert (
+        "101.235 USDT - 5% buffer = 9.61728394 contracts / 0.96172839 ETH / 96.173 USDT"
+        in caplog.messages[0]
+    )

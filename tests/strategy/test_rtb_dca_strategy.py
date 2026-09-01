@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from pandas import DataFrame, date_range
 
+from freqtrade.enums import RunMode
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
 from freqtrade.persistence import Order, Trade
 from user_data.strategies.rtb_dca_strategy import (
@@ -261,9 +262,58 @@ def test_tags_follow_directional_composition_pattern() -> None:
     assert strategy.EMERGENCY_BREAK_EVEN_EXIT_TAG == "🛟"
 
 
-def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ETH/USDT:USDT short 2026-01-01 00:00] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_custom_stake_logs_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
     strategy = _strategy()
+    strategy.config["runmode"] = runmode
+
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
+        stake = strategy.custom_stake_amount(
+            pair="ETH/USDT:USDT",
+            current_time=datetime(2026, 1, 1, tzinfo=UTC),
+            current_rate=100.0,
+            proposed_stake=207.8125,
+            min_stake=None,
+            max_stake=207.8125,
+            leverage=10.0,
+            entry_tag="📉-📍",
+            side="short",
+        )
+
+    assert stake == pytest.approx(10.0)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{expected_prefix}Initial stake requested | "
+        "10 USDT | DCA budget 207.812 USDT / multiplier 20.78125"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[ETH/USDT:USDT long 2026-01-01 00:03] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_order_fill_logs_backtest_context_only(
+    caplog,
+    monkeypatch,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
+    strategy = _strategy()
+    strategy.config["runmode"] = runmode
     trade = _trade(False)
+    trade.contract_size = 1.0
     data = _custom_data(monkeypatch, trade)
     dataframe = _ohlcv(np.array([100.0, 101.0, 102.0, 103.0]))
     dataframe["basis"] = [100.5, 101.5, 102.5, 103.5]
@@ -295,8 +345,10 @@ def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch)
     assert data["rtb_tp_atr"] == pytest.approx(3.5)
     assert data["rtb_last_dca_signal_time"] == str(dataframe["date"].iat[1])
     messages = [record.getMessage() for record in caplog.records]
-    assert messages[0].startswith("BO filled | #81 ETH/USDT:USDT long")
-    assert messages[1].startswith("SO filled | #81 ETH/USDT:USDT long")
+    assert messages == [
+        f"{expected_prefix}BO filled | 1 contracts / 1 ETH / 100 USDT",
+        f"{expected_prefix}SO1 filled | 1 contracts / 1 ETH / 95 USDT",
+    ]
     assert "🛡️" not in messages[1]
 
 
@@ -515,9 +567,8 @@ def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_roundi
     selector = "min" if is_short else "max"
     target_operator = "-" if is_short else "+"
     fee_operator = "+" if is_short else "-"
-    side = "short" if is_short else "long"
     assert message == (
-        f"TP limit | #81 ETH/USDT:USDT {side} | 2026-01-01 01:00 | "
+        "TP limit | "
         f"limit {strategy._format_log_number(expected_tp_rate)} | "
         f"target = {selector}(basis 100, minimum "
         f"{strategy._format_log_number(minimum_tp_rate)}) | "
@@ -596,7 +647,7 @@ def test_resting_tp_does_not_block_qualifying_safety_order(caplog, monkeypatch) 
     assert adjustment[1] == "📈-🛡️⓵"
     assert data["rtb_last_dca_signal_time"] == str(dataframe["date"].iat[-1])
     message = next(record.getMessage() for record in caplog.records)
-    assert message.startswith("SO requested | #81 ETH/USDT:USDT long")
+    assert message == "SO1 requested | 150 USDT"
     assert "🛡️" not in message
 
 
@@ -624,7 +675,7 @@ def test_safety_order_skip_log_uses_trigger_comparison_and_remaining_distance(
 
     assert adjustment is None
     assert [record.getMessage() for record in caplog.records] == [
-        "SO skipped | #81 ETH/USDT:USDT long | 2026-01-01 00:00 | "
+        "SO skipped | "
         "close 98.1 > trigger 98 | remaining 0.1 | "
         "trigger = last entry 100 - 2 x ATR 1"
     ]
@@ -692,7 +743,7 @@ def test_emergency_break_even_replaces_normal_target_after_final_safety_order(
     assert result == pytest.approx(expected)
     message = next(record.getMessage() for record in caplog.records)
     assert message == (
-        "Emergency BE limit | #81 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        "Emergency BE limit | "
         f"limit {strategy._format_log_number(expected)} | "
         f"target = BE {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
     )
@@ -738,8 +789,9 @@ def test_leverage_logs_selected_buffered_tier(caplog) -> None:
     assert strategy.leverage(**callback_args) == pytest.approx(9.0)
     assert [record.getMessage() for record in caplog.records] == [
         (
-            "Leverage selected | LTC/USDT:USDT long | 2026-01-01 00:00 | 9x | "
+            "Leverage selected | 9x | "
             "DCA 100 USDT + hedge 100 USDT | gross notional 1800 USDT | "
-            "tier 2/2, usable 1900 USDT (5% buffer) | utilization 94.74%"
+            "tier 2/2, usable 2000 USDT - 5% buffer = 1900 USDT | "
+            "utilization 94.74%"
         )
     ]

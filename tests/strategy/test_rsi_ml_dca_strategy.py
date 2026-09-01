@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from pandas import DataFrame, Series, date_range
 
-from freqtrade.enums import MarginMode
+from freqtrade.enums import MarginMode, RunMode
 from freqtrade.persistence import CustomDataWrapper, Order, Trade
 from user_data.strategies.rsi_ml_dca_strategy import (
     RSIMLDCAStrategy,
@@ -17,7 +17,7 @@ from user_data.strategies.rsi_ml_dca_strategy import (
 
 
 def _strategy() -> RSIMLDCAStrategy:
-    strategy = RSIMLDCAStrategy({})
+    strategy = RSIMLDCAStrategy({"stake_currency": "USDT"})
     strategy.tp_atr_mult.value = 3.0
     strategy.leverage_buffer_pct.value = 5.0
     return strategy
@@ -240,7 +240,7 @@ def test_emergency_break_even_precedes_dataframe_exits_and_logs_target(
 
     assert adjustment == (-trade.stake_amount, strategy.EMERGENCY_BREAK_EVEN_EXIT_TAG)
     assert [record.getMessage() for record in caplog.records] == [
-        "Emergency BE | #907 ETH/USDT:USDT long | 2026-08-17 00:00 | "
+        "Emergency BE | "
         f"limit {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
     ]
 
@@ -491,20 +491,23 @@ def test_populate_indicators_keeps_only_callback_and_plot_columns() -> None:
     assert not any(column.startswith("_") for column in result.columns)
 
 
-def test_populate_entry_trend_uses_extracted_order_tags(monkeypatch) -> None:
+def test_populate_entry_trend_requires_mrc_extreme_and_uses_order_tags(monkeypatch) -> None:
     strategy = _strategy()
-    monkeypatch.setattr(strategy.mrc_enable, "value", False)
     monkeypatch.setattr(strategy.enable_longs, "value", True)
     monkeypatch.setattr(strategy.enable_shorts, "value", True)
     dataframe = DataFrame(
         {
-            "signal": ["↑", "↓"],
-            "volume": [100.0, 100.0],
+            "signal": ["↑", "↓", "↑", "↓"],
+            "open": [90.0, 110.0, 100.0, 100.0],
+            "mrc_lower": [95.0, 95.0, 95.0, 95.0],
+            "mrc_upper": [105.0, 105.0, 105.0, 105.0],
+            "volume": [100.0, 100.0, 100.0, 100.0],
         }
     )
 
     result = strategy.populate_entry_trend(dataframe, {"pair": "ETH/USDT:USDT"})
 
+    assert not hasattr(strategy, "mrc_enable")
     assert strategy.LONG_TAG_PREFIX == "📈"
     assert strategy.SHORT_TAG_PREFIX == "📉"
     assert strategy.ENTRY_TAG_SUFFIX == "-📍"
@@ -514,6 +517,8 @@ def test_populate_entry_trend_uses_extracted_order_tags(monkeypatch) -> None:
     assert strategy.SHORT_ENTRY_TAG == strategy.SHORT_TAG_PREFIX + strategy.ENTRY_TAG_SUFFIX
     assert result.loc[0, "enter_tag"] == strategy.LONG_ENTRY_TAG
     assert result.loc[1, "enter_tag"] == strategy.SHORT_ENTRY_TAG
+    assert np.isnan(result.loc[2, "enter_long"])
+    assert np.isnan(result.loc[3, "enter_short"])
 
 
 @pytest.mark.parametrize(
@@ -550,11 +555,23 @@ def test_custom_stake_reserves_dca_budget_for_fixed_and_unlimited_stakes(
     assert stake == pytest.approx(expected_initial_stake)
 
 
-def test_custom_stake_logs_requested_stake_without_trade_id(caplog) -> None:
+@pytest.mark.parametrize(
+    ("runmode", "expected_prefix"),
+    [
+        (RunMode.BACKTEST, "[DOGE/USDT:USDT long 2026-07-24 21:22] "),
+        (RunMode.LIVE, ""),
+    ],
+)
+def test_custom_stake_logs_backtest_context_only(
+    caplog,
+    runmode: RunMode,
+    expected_prefix: str,
+) -> None:
     strategy = RSIMLDCAStrategy(
         {
             "stake_amount": 1130.81668108,
             "stake_currency": "USDT",
+            "runmode": runmode,
         }
     )
     strategy.vol_scale.value = 2.0
@@ -578,19 +595,25 @@ def test_custom_stake_logs_requested_stake_without_trade_id(caplog) -> None:
 
     assert stake == pytest.approx(1130.81668108 / 63.0)
     assert [record.getMessage() for record in caplog.records] == [
-        "Initial stake requested | DOGE/USDT:USDT long | 2026-07-24 21:22 | "
+        f"{expected_prefix}Initial stake requested | "
         "17.949 USDT | DCA budget 1130.817 USDT ÷ DCA factor 63 "
         "(∑ 1 + 2 + 4 + 8 + 16 + 32)"
     ]
 
 
-def test_order_filled_logs_actual_initial_stake_but_not_safety_orders(caplog) -> None:
+def test_order_filled_logs_executed_quantities_for_base_and_safety_orders(caplog) -> None:
     strategy = RSIMLDCAStrategy({"stake_currency": "USDT"})
     requested_time = datetime(2026, 7, 24, 21, 22, tzinfo=UTC)
+    dataframe = DataFrame(
+        {"date": [datetime(2026, 7, 24, 21, 21, tzinfo=UTC)], "close": [0.1]}
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda pair, timeframe: (dataframe, None))
+    caplog.set_level(logging.INFO, logger="user_data.strategies.rsi_ml_dca_strategy")
     trade = _trade(False)
     trade.id = 41
     trade.pair = "DOGE/USDT:USDT"
     trade.leverage = 20.0
+    trade.contract_size = 1.0
     price = 17.947 * trade.leverage / 3600.0
     first_order = Order.parse_from_ccxt_object(
         {
@@ -624,7 +647,7 @@ def test_order_filled_logs_actual_initial_stake_but_not_safety_orders(caplog) ->
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
-        "Initial order filled | #41 DOGE/USDT:USDT long | 2026-07-24 21:22 | 17.947 USDT",
+        "BO filled | 3600 contracts / 3600 DOGE / 358.94 USDT",
     ]
 
     second_order = Order.parse_from_ccxt_object(
@@ -654,7 +677,7 @@ def test_order_filled_logs_actual_initial_stake_but_not_safety_orders(caplog) ->
         current_time=datetime(2026, 7, 24, 21, 23, tzinfo=UTC),
     )
 
-    assert caplog.text == ""
+    assert caplog.messages == ["SO1 filled | 7200 contracts / 7200 DOGE / 717.88 USDT"]
 
 
 def test_initial_fill_consumes_entry_signal_before_safety_order() -> None:
@@ -969,12 +992,12 @@ def test_take_profit_logs_each_candle_result_once(caplog) -> None:
     break_even_rate = trade.calc_close_rate_for_roi(0.0)
     skipped_rate = tp_target_rate - 0.00001
     assert messages == [
-        "TP skipped | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 | "
+        "TP skipped | "
         f"exit {strategy._format_log_number(skipped_rate)} < "
         f"target {strategy._format_log_number(tp_target_rate)} | remaining 0.00001 | "
         f"target = BE {strategy._format_log_number(break_even_rate)} + "
         "3 x ATR 0.00003625",
-        "TP reached | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 | "
+        "TP reached | "
         f"exit {strategy._format_log_number(tp_target_rate)} >= "
         f"target {strategy._format_log_number(tp_target_rate)} | beyond 0 | "
         f"target = BE {strategy._format_log_number(break_even_rate)} + "
@@ -1094,10 +1117,9 @@ def test_safety_order_atr_skip_is_logged_once(
                 is None
             )
 
-    side = "short" if is_short else "long"
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
-        f"SO skipped | #{trade.id} DOGE/USDT:USDT {side} | 2026-07-24 21:22 | "
+        "SO skipped | "
         f"close {strategy._format_log_number(candle_close)} {comparison} "
         f"trigger {strategy._format_log_number(so_trigger_rate)} | "
         f"remaining {strategy._format_log_number(abs(candle_close - so_trigger_rate))} | "
@@ -1146,9 +1168,10 @@ def test_leverage_uses_complete_dca_and_hedge_budget(caplog) -> None:
     assert leverage == 16.0
     assert [record.getMessage() for record in caplog.records] == [
         (
-            "Leverage selected | LTC/USDT:USDT long | 2026-07-24 21:22 | 16x | "
+            "Leverage selected | 16x | "
             "DCA 500 USDT + hedge 500 USDT | gross notional 16000 USDT | "
-            "tier 5/7, usable 17100 USDT (5% buffer) | utilization 93.57%"
+            "tier 5/7, usable 18000 USDT - 5% buffer = 17100 USDT | "
+            "utilization 93.57%"
         )
     ]
 
