@@ -1190,18 +1190,25 @@ class FreqtradeBot(LoggingMixin):
             raise PricingError("Could not determine entry price.")
 
         if self.trading_mode != TradingMode.SPOT and trade is None:
-            max_leverage = self.exchange.get_max_leverage(pair, stake_amount)
-            if leverage_:
+            custom_tier_selection = self.strategy.use_custom_leverage_tier_selection
+            leverage_stake = 0.0 if custom_tier_selection else stake_amount
+            max_leverage = self.exchange.get_max_leverage(pair, leverage_stake)
+            if leverage_ and not custom_tier_selection:
                 leverage = leverage_
             else:
+                leverage_kwargs = {"proposed_stake": stake_amount} if custom_tier_selection else {}
+                callback_max_leverage = (
+                    min(max_leverage, leverage_) if leverage_ else max_leverage
+                )
                 leverage = strategy_safe_wrapper(self.strategy.leverage, default_retval=1.0)(
                     pair=pair,
                     current_time=datetime.now(UTC),
                     current_rate=enter_limit_requested,
-                    proposed_leverage=1.0,
-                    max_leverage=max_leverage,
+                    proposed_leverage=leverage_ or 1.0,
+                    max_leverage=callback_max_leverage,
                     side=trade_side,
                     entry_tag=entry_tag,
+                    **leverage_kwargs,
                 )
             # Cap leverage between 1.0 and max_leverage.
             leverage = min(max(leverage, 1.0), max_leverage)

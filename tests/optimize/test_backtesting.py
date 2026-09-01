@@ -612,7 +612,10 @@ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
     mocker.patch(
         "freqtrade.persistence.trade_model.price_to_precision", lambda p, *args, **kwargs: p
     )
-    mocker.patch(f"{EXMS}.get_max_leverage", return_value=100)
+    mock_max_leverage = mocker.patch(
+        f"{EXMS}.get_max_leverage",
+        return_value=100,
+    )
     mocker.patch("freqtrade.optimize.backtesting.price_to_precision", lambda p, *args: p)
     patch_exchange(mocker)
     default_conf_usdt["stake_amount"] = 300
@@ -623,6 +626,7 @@ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
     default_conf_usdt["exchange"]["pair_whitelist"] = [".*"]
     backtesting = Backtesting(default_conf_usdt)
     backtesting._set_strategy(backtesting.strategylist[0])
+    backtesting.strategy.use_custom_leverage_tier_selection = True
     mocker.patch("freqtrade.optimize.backtesting.Backtesting._run_funding_fees")
     pair = "ETH/USDT:USDT"
     row = [
@@ -663,6 +667,8 @@ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
 
     trade = backtesting._enter_trade(pair, row=row, direction="long")
     assert pytest.approx(trade.liquidation_price) == 0.081767037
+    assert backtesting.strategy.leverage.call_args.kwargs["proposed_stake"] == 300
+    assert mock_max_leverage.call_args_list[0].args == (pair, 0.0)
 
     # Binance, Short
     # liquidation_price
@@ -685,6 +691,61 @@ def test_backtest__enter_trade_futures(default_conf_usdt, fee, mocker) -> None:
 
     trade = backtesting._enter_trade(pair, row=row, direction="long")
     assert trade is None
+
+
+def test_backtest_custom_tier_selector_uses_adjusted_rate_and_strategy_stoploss(
+    default_conf_usdt, mocker
+) -> None:
+    default_conf_usdt["trading_mode"] = "futures"
+    default_conf_usdt["margin_mode"] = "isolated"
+    default_conf_usdt["stake_currency"] = "USDT"
+    default_conf_usdt["stake_amount"] = 300
+    default_conf_usdt["exchange"]["pair_whitelist"] = [".*"]
+    mock_min_stake = mocker.patch(f"{EXMS}.get_min_pair_stake_amount", return_value=1.0)
+    mocker.patch(f"{EXMS}.get_max_pair_stake_amount", return_value=float("inf"))
+    mocker.patch(f"{EXMS}.get_max_leverage", return_value=50.0)
+    mocker.patch("freqtrade.optimize.backtesting.price_to_precision", lambda p, *args: p)
+    patch_exchange(mocker)
+    backtesting = Backtesting(default_conf_usdt)
+    backtesting._set_strategy(backtesting.strategylist[0])
+    backtesting.strategy.use_custom_leverage_tier_selection = True
+    backtesting.strategy.custom_entry_price = MagicMock(return_value=0.105)
+    backtesting.strategy.leverage = MagicMock(return_value=5.0)
+    pair = "ETH/USDT:USDT"
+    current_time = pd.Timestamp(year=2020, month=1, day=1, hour=5).to_pydatetime()
+    row = (
+        pd.Timestamp(current_time),
+        0.1,
+        0.12,
+        0.099,
+        0.11,
+        1,
+        0,
+        0,
+        0,
+        "",
+        "",
+        "",
+    )
+
+    rate, _, leverage, _ = backtesting.get_valid_entry_price_and_stake(
+        pair=pair,
+        row=row,
+        propose_rate=0.1,
+        stake_amount=300.0,
+        direction="long",
+        current_time=current_time,
+        entry_tag=None,
+        trade=None,
+        order_type="limit",
+        price_precision=None,
+        precision_mode_price=2,
+    )
+
+    assert rate == pytest.approx(0.105)
+    assert leverage == 5.0
+    assert backtesting.strategy.leverage.call_args.kwargs["current_rate"] == pytest.approx(0.105)
+    assert mock_min_stake.call_args.args == (pair, 0.105, backtesting.strategy.stoploss)
 
     # Stake-amount throwing error
     mocker.patch(

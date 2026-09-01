@@ -1201,7 +1201,39 @@ def test_execute_entry_min_leverage(mocker, default_conf_usdt, fee, limit_order,
     assert freqtrade.execute_entry(pair, stake_amount, is_short=is_short)
     trade = Trade.session.scalars(select(Trade)).first()
     assert trade.leverage == 5.0
+    assert "proposed_stake" not in freqtrade.strategy.leverage.call_args.kwargs
     # assert trade.stake_amount == 2
+
+
+def test_execute_entry_uses_pair_cap_for_custom_tier_selector(
+    mocker, default_conf_usdt, fee, limit_order
+) -> None:
+    default_conf_usdt["trading_mode"] = "futures"
+    default_conf_usdt["margin_mode"] = "isolated"
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    pair = "SOL/BUSD:BUSD"
+    stake_amount = 2200.0
+    mock_max_leverage = MagicMock(return_value=50.0)
+    mocker.patch.multiple(
+        EXMS,
+        fetch_ticker=MagicMock(return_value={"bid": 1.9, "ask": 2.2, "last": 1.9}),
+        create_order=MagicMock(return_value=limit_order["buy"]),
+        get_rate=MagicMock(return_value=0.11),
+        get_min_pair_stake_amount=MagicMock(return_value=1.0),
+        get_max_pair_stake_amount=MagicMock(return_value=float("inf")),
+        get_maintenance_ratio_and_amt=MagicMock(return_value=(0.0, 0.0)),
+        _fetch_and_calculate_funding_fees=MagicMock(return_value=0),
+        get_fee=fee,
+        get_max_leverage=mock_max_leverage,
+    )
+    freqtrade.strategy.use_custom_leverage_tier_selection = True
+    freqtrade.strategy.leverage = MagicMock(return_value=6.0)
+
+    assert freqtrade.execute_entry(pair, stake_amount, leverage_=40.0)
+    mock_max_leverage.assert_called_once_with(pair, 0.0)
+    assert freqtrade.strategy.leverage.call_args.kwargs["max_leverage"] == 40.0
+    assert freqtrade.strategy.leverage.call_args.kwargs["proposed_stake"] == stake_amount
+    assert Trade.session.scalars(select(Trade)).first().leverage == 6.0
 
 
 @pytest.mark.parametrize(

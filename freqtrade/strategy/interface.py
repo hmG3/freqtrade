@@ -118,6 +118,9 @@ class IStrategy(ABC, HyperStrategyMixin):
     position_adjustment_enable: bool = False
     max_entry_position_adjustment: int = -1
 
+    # Let leverage() validate tier capacity against a strategy-managed full-position budget.
+    use_custom_leverage_tier_selection: bool = False
+
     # Number of seconds after which the candle will no longer result in a buy on expired candles
     ignore_buying_expired_candle_after: int = 0
 
@@ -850,6 +853,8 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param max_leverage: Max leverage allowed on this pair
         :param entry_tag: Optional entry_tag (buy_tag) if provided with the buy signal.
         :param side: 'long' or 'short' - indicating the direction of the proposed trade
+        :param kwargs: With use_custom_leverage_tier_selection, includes proposed_stake,
+            the collateral amount available before custom_stake_amount() is applied.
         :return: A leverage amount, which is between 1.0 and max_leverage.
         """
         return 1.0

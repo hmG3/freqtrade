@@ -1069,16 +1069,20 @@ class Backtesting:
             except DependencyException:
                 return 0, 0, 0, 0
 
-            max_leverage = self.exchange.get_max_leverage(pair, stake_amount)
+            custom_tier_selection = self.strategy.use_custom_leverage_tier_selection
+            leverage_stake = 0.0 if custom_tier_selection else stake_amount
+            max_leverage = self.exchange.get_max_leverage(pair, leverage_stake)
+            leverage_kwargs = {"proposed_stake": stake_amount} if custom_tier_selection else {}
             leverage = (
                 strategy_safe_wrapper(self.strategy.leverage, default_retval=1.0)(
                     pair=pair,
                     current_time=current_time,
-                    current_rate=row[OPEN_IDX],
+                    current_rate=propose_rate,
                     proposed_leverage=1.0,
                     max_leverage=max_leverage,
                     side=direction,
                     entry_tag=entry_tag,
+                    **leverage_kwargs,
                 )
                 if self.trading_mode != TradingMode.SPOT
                 else 1.0
@@ -1088,7 +1092,10 @@ class Backtesting:
 
         min_stake_amount = (
             self.exchange.get_min_pair_stake_amount(
-                pair, propose_rate, -0.05 if not pos_adjust else 0.0, leverage=leverage
+                pair,
+                propose_rate,
+                self.strategy.stoploss if not pos_adjust else 0.0,
+                leverage=leverage,
             )
             or 0
         )
