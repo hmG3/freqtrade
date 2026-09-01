@@ -33,6 +33,8 @@ from freqtrade.exceptions import (
 from freqtrade.loggers import setup_logging, setup_logging_pre
 from freqtrade.optimize.backtesting import Backtesting
 from freqtrade.persistence import CustomDataWrapper, Trade
+from freqtrade.persistence.custom_data import _CustomData
+from freqtrade.persistence.models import _request_id_ctx_var
 from freqtrade.rpc import RPC
 from freqtrade.rpc.api_server import ApiServer
 from freqtrade.rpc.api_server.api_auth import create_token, get_user_from_token
@@ -2346,6 +2348,65 @@ def test_api_pair_candles(botclient, ohlcv_history, annotations, expected):
             None,
         ],
     ]
+
+
+def test_api_pair_candles_removes_request_scoped_custom_data_sessions(
+    botclient, ohlcv_history, fee
+):
+    ftbot, client = botclient
+    timeframe = "5m"
+    custom_data_key = "plot_break_even_steps"
+    custom_data_value = [{"rate": 101.0}]
+    request_ids: list[str | None] = []
+    loaded_values: list[object] = []
+
+    create_mock_trades(fee)
+    trade = Trade.get_trades([Trade.id == 1]).first()
+    trade.set_custom_data(custom_data_key, custom_data_value)
+    trade_id = trade.id
+    Trade.session.remove()
+
+    for signal_column in ("enter_long", "exit_long", "enter_short", "exit_short"):
+        ohlcv_history[signal_column] = 0
+    ftbot.dataprovider._set_cached_df("XRP/BTC", timeframe, ohlcv_history, CandleType.SPOT)
+
+    def plot_annotations(**kwargs):
+        request_ids.append(_request_id_ctx_var.get())
+        request_trade = Trade.get_trades([Trade.id == trade_id]).first()
+        loaded_values.append(request_trade.get_custom_data(custom_data_key))
+        return []
+
+    ftbot.strategy.plot_annotations = plot_annotations
+
+    registered_sessions: list[tuple[bool, bool]] = []
+    try:
+        for _ in range(2):
+            response = client_get(
+                client,
+                f"{BASE_URI}/pair_candles?limit=3&pair=XRP%2FBTC&timeframe={timeframe}",
+            )
+            assert_response(response)
+
+        for request_id in request_ids:
+            context_token = _request_id_ctx_var.set(request_id)
+            try:
+                registered_sessions.append(
+                    (Trade.session.registry.has(), _CustomData.session.registry.has())
+                )
+            finally:
+                _request_id_ctx_var.reset(context_token)
+
+        assert len(set(request_ids)) == 2
+        assert loaded_values == [custom_data_value, custom_data_value]
+        assert registered_sessions == [(False, False), (False, False)]
+    finally:
+        for request_id in request_ids:
+            context_token = _request_id_ctx_var.set(request_id)
+            try:
+                Trade.session.remove()
+                _CustomData.session.remove()
+            finally:
+                _request_id_ctx_var.reset(context_token)
 
 
 def test_api_pair_history(botclient, tmp_path, mocker):
