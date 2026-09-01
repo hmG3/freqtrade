@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "numba": {
+      "source": "tondevrel/scientific-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/numba/SKILL.md",
+      "computedHash": "393d64aedd82289fd1b7b192aa527c2ad557fcfde957b669b801253e91daddd8"
+    },
+    "pandas-pro": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/pandas-pro/SKILL.md",
+      "computedHash": "244a87c4e9e20aac2822cdd99a221a7fa6999bf1194abbbd4a5e16bde34bf6ef"
+    }
+  }
+}

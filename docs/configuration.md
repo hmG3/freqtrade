@@ -555,7 +555,7 @@ Configuration:
     Please carefully read the section [Market order pricing](#market-order-pricing) section when using market orders.
 
 !!! Note "Native chase orders"
-    `"chase"` can be used only for `entry` and `exit` orders on OKX and Gate.io in isolated futures mode. Both `order_time_in_force.entry` and `order_time_in_force.exit` must be `GTC` when their corresponding order type is `"chase"`.
+    `"chase"` can be used only for `entry` and `exit` orders on OKX and Gate.io in isolated or cross futures mode. Both `order_time_in_force.entry` and `order_time_in_force.exit` must be `GTC` when their corresponding order type is `"chase"`.
 
     In live trading, the exchange maintains a post-only child order at the current best bid or ask. Freqtrade does not apply a distance or maximum-price cap and does not replace these orders through `adjust_order_price()`. Regular unfilled-order timeouts still apply.
 

@@ -278,7 +278,9 @@ Kucoin accounts may use `KCS` for fees, and if a trade happens to be on `KCS`, f
 !!! Tip "Stoploss on Exchange"
     OKX supports `stoploss_on_exchange` with both stop-limit and stop-market orders on spot and futures markets. You can use either `"limit"` or `"market"` in the `order_types.stoploss` configuration setting to select the stoploss order type.
 
-OKX supports native best-price chase orders by setting `order_types.entry` and/or `order_types.exit` to `"chase"`. This is available only with `trading_mode: "futures"`, `margin_mode: "isolated"`, and `GTC` time in force. It is not available through the `myokx` or `okxus` regional adapters.
+OKX supports USDT-settled linear futures in both isolated and cross margin mode. Cross margin requires the OKX account to use Futures mode (`acctLv: "2"`); Freqtrade validates this setting at startup and does not change it. Cross margin is not available through the `myokx` or `okxus` regional adapters.
+
+OKX supports native best-price chase orders by setting `order_types.entry` and/or `order_types.exit` to `"chase"`. This is available with `trading_mode: "futures"`, `margin_mode: "isolated"` or `"cross"`, and `GTC` time in force. It is not available through the `myokx` or `okxus` regional adapters.
 
 OKX requires a passphrase for each api key, you will therefore need to add this key into the configuration so your exchange section looks as follows:
 
@@ -310,7 +312,9 @@ Using the wrong exchange will result in the error "OKX Error 50119: API key does
 
 Gate.io supports [time_in_force](configuration.md#understand-order_time_in_force) with settings "GTC" (good till cancelled), and "IOC" (immediate-or-cancel) settings.
 
-Gate.io supports native best-price chase orders by setting `order_types.entry` and/or `order_types.exit` to `"chase"`. This is available only with `trading_mode: "futures"`, `margin_mode: "isolated"`, and `GTC` time in force. It is not available through the `gateeu` adapter.
+Gate.io supports USDT-settled linear futures in both isolated and cross margin mode. For cross margin, the futures account must use classic (`margin_mode: 0`) or single-currency (`margin_mode: 3`) margin mode. Freqtrade validates the account and position modes at startup and does not change them. Cross margin is not available through the `gateeu` adapter.
+
+Gate.io supports native best-price chase orders by setting `order_types.entry` and/or `order_types.exit` to `"chase"`. This is available with `trading_mode: "futures"`, `margin_mode: "isolated"` or `"cross"`, and `GTC` time in force. It is not available through the `gateeu` adapter.
 
 Gate.io allows the use of `POINT` to pay for fees. As this is not a tradable currency (no regular market available), automatic fee calculations will fail (and default to a fee of 0).
 The configuration parameter `exchange.unknown_fee_rate` can be used to specify the exchange rate between Point and the stake currency. Obviously, changing the stake-currency will also require changes to this value.

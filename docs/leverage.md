@@ -67,7 +67,6 @@ A futures pair will therefore have the naming of `base/quote:settle` (e.g. `ETH/
 ### Margin mode
 
 On top of `trading_mode` - you will also have to configure your `margin_mode`.
-While freqtrade currently only supports one margin mode, this will change, and by configuring it now you're all set for future updates.
 
 The possible values are: `isolated`, or `cross`.
 
@@ -89,10 +88,18 @@ One account is used to share collateral between markets (trading pairs). Margin 
 
 Please read the [exchange specific notes](exchanges.md) for exchanges that support this mode and how they differ.
 
+Cross margin is currently supported for USDT-settled linear futures on the primary OKX and Gate.io adapters. Regional adapters such as `myokx`, `okxus`, and `gateeu` do not support cross margin.
+
 !!! Warning "Increased risk of liquidation"
     Cross margin mode increases the risk of full account liquidation, as all trades share the same collateral.
     A loss on one trade can affect the liquidation price of other trades.  
-    Also, cross-position influence may not be fully simulated in dry-run or backtesting mode.
+    Do not run multiple bots on the same leveraged account. Freqtrade cannot account for positions or collateral managed outside the current bot.
+
+#### Cross margin liquidation prices
+
+In live trading, Freqtrade uses the liquidation price reported by the exchange. If the exchange omits the price or reports a non-actionable sentinel value, Freqtrade leaves the liquidation price unset instead of substituting a local estimate.
+
+Dry-run estimates share the simulated wallet collateral across open positions and value the other positions using one current mark-price snapshot. Backtesting and hyperopt use the other positions' entry rates because no live mark-price snapshot is available. These local calculations are estimates and cannot reproduce every exchange risk-engine input or portfolio-margin rule.
 
 ## Set leverage to use
 
