@@ -184,6 +184,21 @@ class Gate(Exchange):
         market = self.markets[pair]
         return market["id"], market["settle"].lower()
 
+    @staticmethod
+    def _get_chase_response_item(
+        response: dict, error_cls: type[ccxt.BaseError] = ccxt.InvalidOrder
+    ) -> dict:
+        code = response.get("code")
+        if code is not None and str(code) != "0":
+            raise error_cls(response.get("message") or str(response))
+        payload = response.get("data", response)
+        if not isinstance(payload, dict):
+            raise error_cls(response.get("message") or str(response))
+        item = payload.get("order", payload)
+        if not isinstance(item, dict):
+            raise error_cls(response.get("message") or str(response))
+        return item
+
     def _is_valid_liquidation_price(self, liquidation_price: float | None) -> bool:
         if liquidation_price is None or not super()._is_valid_liquidation_price(liquidation_price):
             return False
@@ -213,7 +228,7 @@ class Gate(Exchange):
             "{settle}/autoorder/v1/chase/create", ["private", "futures"], "POST", request
         )
         self._log_exchange_response("create_chase_order", response)
-        item = response.get("order", response)
+        item = self._get_chase_response_item(response)
         if not item.get("id"):
             raise ccxt.InvalidOrder(item.get("error_label") or str(response))
         return {
@@ -291,7 +306,7 @@ class Gate(Exchange):
                 {"settle": settle, "id": order_id},
             )
             self._log_exchange_response("fetch_chase_order", response)
-            item = response.get("order", response)
+            item = self._get_chase_response_item(response, ccxt.OrderNotFound)
             if not item.get("id"):
                 raise ccxt.OrderNotFound(
                     item.get("error_label") or f"Chase order {order_id} was not returned."
@@ -329,8 +344,8 @@ class Gate(Exchange):
                 {"settle": settle, "id": order_id},
             )
             self._log_exchange_response("cancel_chase_order", response)
-            item = response.get("order", response)
-            if item.get("id"):
+            item = self._get_chase_response_item(response)
+            if item.get("id") and item.get("amount") is not None:
                 return self._normalize_chase_order(pair, item)
             return self.fetch_chase_order(order_id, pair)
         except ccxt.InvalidOrder as e:

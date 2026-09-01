@@ -9,8 +9,10 @@ from freqtrade.exceptions import (
     DDosProtection,
     InvalidOrderException,
     OperationalException,
+    RetryableOrderError,
     TemporaryError,
 )
+from freqtrade.exchange.common import API_RETRY_COUNT
 from tests.conftest import EXMS, get_patched_exchange
 
 
@@ -356,31 +358,70 @@ def test_create_chase_order_gate(default_conf, mocker, markets, side, reduce_onl
     assert order["status"] == "open"
 
 
+def test_create_chase_order_gate_accepts_success_envelope(default_conf, mocker, markets):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.CROSS
+    api_mock = MagicMock()
+    api_mock.fetch2.return_value = {
+        "code": 0,
+        "message": "ok",
+        "data": {"id": "8964187"},
+        "timestamp": 1787579705985,
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={"ETH/USDT:USDT": markets["ETH/USDT:USDT"]},
+    )
+    exchange._config["dry_run"] = False
+    mocker.patch.object(exchange, "_lev_prep")
+
+    order = exchange.create_order(
+        pair="ETH/USDT:USDT",
+        ordertype="chase",
+        side="buy",
+        amount=20.0,
+        rate=2500.0,
+        leverage=3.0,
+    )
+
+    assert order["id"] == "8964187"
+    assert order["status"] == "open"
+    assert order["amount"] == 20.0
+
+
 def test_fetch_chase_order_gate_normalizes_parent_and_child(default_conf, mocker, markets):
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
     default_conf["margin_mode"] = MarginMode.ISOLATED
     api_mock = MagicMock()
     api_mock.fetch2.return_value = {
-        "order": {
-            "id": "12345",
-            "contract": "ETH_USDT",
-            "settle": "usdt",
-            "amount": "-2",
-            "status": "finished",
-            "reason": "filled",
-            "fill_amount": "-2",
-            "average_fill_price": "2501.5",
-            "suborder_id": "67890",
-            "suborder_price": "2501.5",
-            "suborder_ongoing": False,
-            "suborder_finish_as": "succeeded",
-            "create_time": 1710000000,
-            "finish_time": 1710000001,
-            "status_code": "",
-            "error_label": "",
-            "reduce_only": True,
-        }
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "order": {
+                "id": "12345",
+                "contract": "ETH_USDT",
+                "settle": "usdt",
+                "amount": "-2",
+                "status": "finished",
+                "reason": "filled",
+                "fill_amount": "-2",
+                "average_fill_price": "2501.5",
+                "suborder_id": "67890",
+                "suborder_price": "2501.5",
+                "suborder_ongoing": False,
+                "suborder_finish_as": "succeeded",
+                "create_time": 1710000000,
+                "finish_time": 1710000001,
+                "status_code": "",
+                "error_label": "",
+                "reduce_only": True,
+            }
+        },
     }
     exchange = get_patched_exchange(
         mocker,
@@ -409,23 +450,51 @@ def test_fetch_chase_order_gate_normalizes_parent_and_child(default_conf, mocker
     assert order["average"] == 2501.5
 
 
+def test_fetch_chase_order_gate_retries_error_envelope(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    mocker.patch("freqtrade.exchange.common.time.sleep")
+    api_mock = MagicMock()
+    api_mock.fetch2.return_value = {
+        "code": -1,
+        "message": "Chase order was not found.",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={"ETH/USDT:USDT": markets["ETH/USDT:USDT"]},
+    )
+
+    with pytest.raises(RetryableOrderError, match="Chase order was not found"):
+        exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    assert api_mock.fetch2.call_count == API_RETRY_COUNT + 1
+
+
 def test_cancel_chase_order_gate_preserves_partial_fill(default_conf, mocker, markets):
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
     default_conf["margin_mode"] = MarginMode.ISOLATED
     api_mock = MagicMock()
     api_mock.fetch2.return_value = {
-        "order": {
-            "id": "12345",
-            "contract": "ETH_USDT",
-            "amount": "-2",
-            "status": "finished",
-            "reason": "stopped",
-            "fill_amount": "-1",
-            "average_fill_price": "2501.5",
-            "suborder_id": "67890",
-            "suborder_price": "2501.5",
-        }
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "order": {
+                "id": "12345",
+                "contract": "ETH_USDT",
+                "amount": "-2",
+                "status": "finished",
+                "reason": "stopped",
+                "fill_amount": "-1",
+                "average_fill_price": "2501.5",
+                "suborder_id": "67890",
+                "suborder_price": "2501.5",
+            }
+        },
     }
     exchange = get_patched_exchange(
         mocker,
@@ -448,6 +517,64 @@ def test_cancel_chase_order_gate_preserves_partial_fill(default_conf, mocker, ma
     assert order["status"] == "canceled"
     assert order["filled"] == 10.0
     assert order["remaining"] == 10.0
+
+
+def test_cancel_chase_order_gate_fetches_detail_after_success_ack(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    api_mock = MagicMock()
+    api_mock.fetch2.side_effect = [
+        {
+            "code": 0,
+            "message": "ok",
+            "data": {"id": "12345"},
+        },
+        {
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "order": {
+                    "id": "12345",
+                    "contract": "ETH_USDT",
+                    "amount": "2",
+                    "status": "finished",
+                    "reason": "stopped",
+                    "fill_amount": "0.5",
+                    "average_fill_price": "2501.5",
+                    "suborder_id": "67890",
+                }
+            },
+        },
+    ]
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="gate",
+        mock_markets={"ETH/USDT:USDT": markets["ETH/USDT:USDT"]},
+    )
+
+    order = exchange.cancel_chase_order("12345", "ETH/USDT:USDT")
+
+    assert api_mock.fetch2.call_count == 2
+    assert api_mock.fetch2.call_args_list[0].args == (
+        "{settle}/autoorder/v1/chase/stop",
+        ["private", "futures"],
+        "POST",
+        {"settle": "usdt", "id": "12345"},
+    )
+    assert api_mock.fetch2.call_args_list[1].args == (
+        "{settle}/autoorder/v1/chase/detail",
+        ["private", "futures"],
+        "GET",
+        {"settle": "usdt", "id": "12345"},
+    )
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["status"] == "canceled"
+    assert order["filled"] == 5.0
+    assert order["remaining"] == 15.0
 
 
 @pytest.mark.parametrize(
@@ -489,12 +616,28 @@ def test_fetch_chase_order_gate_maps_terminal_status(
     assert order["filled"] == 0.0
 
 
-def test_create_chase_order_gate_rejects_error_response(default_conf, mocker, markets):
+@pytest.mark.parametrize(
+    ("response", "error_match"),
+    [
+        ({"error_label": "INVALID_PARAM_VALUE"}, "INVALID_PARAM_VALUE"),
+        (
+            {
+                "code": -1,
+                "message": "Failed to submit: active chase limit order.",
+                "timestamp": 1787579711976,
+            },
+            "active chase limit order",
+        ),
+    ],
+)
+def test_create_chase_order_gate_rejects_error_response(
+    default_conf, mocker, markets, response, error_match
+):
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
     default_conf["margin_mode"] = MarginMode.ISOLATED
     api_mock = MagicMock()
-    api_mock.fetch2.return_value = {"error_label": "INVALID_PARAM_VALUE"}
+    api_mock.fetch2.return_value = response
     exchange = get_patched_exchange(
         mocker,
         default_conf,
@@ -504,7 +647,7 @@ def test_create_chase_order_gate_rejects_error_response(default_conf, mocker, ma
     )
     mocker.patch.object(exchange, "_lev_prep")
 
-    with pytest.raises(InvalidOrderException, match="INVALID_PARAM_VALUE"):
+    with pytest.raises(InvalidOrderException, match=error_match):
         exchange.create_order(
             pair="ETH/USDT:USDT",
             ordertype="chase",
