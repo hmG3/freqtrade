@@ -29,7 +29,10 @@ from freqtrade.exchange import (
     Binance,
     Bybit,
     Exchange,
+    GateEU,
     Kraken,
+    Myokx,
+    Okxus,
     date_minus_candles,
     market_is_active,
     timeframe_to_msecs,
@@ -1042,6 +1045,72 @@ def test_validate_order_types_not_in_config(default_conf, mocker):
     Exchange(conf)
 
 
+@pytest.mark.parametrize("exchange_name", ["okx", "gate"])
+def test_validate_chase_order_type(default_conf, mocker, exchange_name):
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["order_types"] = {
+        "entry": "chase",
+        "exit": "limit",
+        "stoploss": "limit",
+        "stoploss_on_exchange": False,
+    }
+    default_conf["order_time_in_force"] = {"entry": "GTC", "exit": "GTC"}
+    exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+
+    exchange.validate_ordertypes(default_conf["order_types"])
+
+    default_conf["order_time_in_force"]["entry"] = "IOC"
+    with pytest.raises(OperationalException, match="Chase orders require GTC time in force"):
+        exchange.validate_ordertypes(default_conf["order_types"])
+
+
+def test_validate_chase_order_type_rejects_unsupported_exchange(default_conf, mocker):
+    default_conf["order_types"] = {
+        "entry": "chase",
+        "exit": "limit",
+        "stoploss": "limit",
+        "stoploss_on_exchange": False,
+    }
+    default_conf["order_time_in_force"] = {"entry": "GTC", "exit": "GTC"}
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+
+    with pytest.raises(OperationalException, match="does not support chase orders"):
+        exchange.validate_ordertypes(default_conf["order_types"])
+
+
+@pytest.mark.parametrize(
+    "exchange_name,trading_mode,margin_mode",
+    [
+        ("okx", TradingMode.SPOT, MarginMode.NONE),
+        ("gate", TradingMode.SPOT, MarginMode.NONE),
+        ("okx", TradingMode.FUTURES, MarginMode.CROSS),
+        ("gate", TradingMode.FUTURES, MarginMode.CROSS),
+    ],
+)
+def test_validate_chase_order_type_rejects_unsupported_mode_or_adapter(
+    default_conf, mocker, exchange_name, trading_mode, margin_mode
+):
+    default_conf["trading_mode"] = trading_mode
+    default_conf["margin_mode"] = margin_mode
+    default_conf["order_types"] = {
+        "entry": "chase",
+        "exit": "limit",
+        "stoploss": "limit",
+        "stoploss_on_exchange": False,
+    }
+    default_conf["order_time_in_force"] = {"entry": "GTC", "exit": "GTC"}
+    exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+
+    with pytest.raises(OperationalException, match="does not support chase orders"):
+        exchange.validate_ordertypes(default_conf["order_types"])
+
+
+@pytest.mark.parametrize("exchange_class", [Myokx, Okxus, GateEU])
+def test_regional_exchange_adapters_do_not_advertise_chase(exchange_class):
+    assert not exchange_class.combine_ft_has(include_futures=True).get("chase_order", False)
+
+
 def test_validate_required_startup_candles(default_conf, mocker, caplog):
     api_mock = MagicMock()
     mocker.patch(f"{EXMS}.name", PropertyMock(return_value="Binance"))
@@ -1123,6 +1192,20 @@ def test_create_dry_run_order(default_conf, mocker, side, exchange_name, leverag
     assert order["symbol"] == "ETH/BTC"
     assert order["amount"] == 1
     assert order["cost"] == 1 * 200
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_create_dry_run_chase_order_uses_limit_fill(default_conf, mocker, side):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+    mocker.patch.object(exchange, "_dry_is_price_crossed", return_value=True)
+
+    order = exchange.create_dry_run_order(
+        pair="ETH/BTC", ordertype="chase", side=side, amount=1, rate=200, leverage=1
+    )
+
+    assert order["type"] == "chase"
+    assert order["status"] == "closed"
+    assert order["filled"] == order["amount"]
 
 
 def test_create_dry_run_order_id_unique_with_same_timestamp(default_conf, mocker, time_machine):
@@ -4569,6 +4652,38 @@ def test_fetch_order_or_stoploss_order(default_conf, mocker):
     assert fetch_stoploss_order_mock.call_count == 1
     assert fetch_stoploss_order_mock.call_args_list[0][0][0] == "1234"
     assert fetch_stoploss_order_mock.call_args_list[0][0][1] == "ETH/BTC"
+
+    fetch_chase_order_mock = mocker.patch.object(exchange, "fetch_chase_order")
+    exchange.fetch_order_or_stoploss_order("5678", "ETH/BTC", order_type="chase")
+    fetch_chase_order_mock.assert_called_once_with("5678", "ETH/BTC")
+
+
+def test_cancel_order_with_result_dispatches_chase(default_conf, mocker):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+    cancel_chase_order = mocker.patch.object(
+        exchange,
+        "cancel_chase_order",
+        return_value={"id": "1234", "status": "canceled", "amount": 2.0, "fee": {}},
+    )
+
+    result = exchange.cancel_order_with_result("1234", "ETH/BTC", 2.0, order_type="chase")
+
+    assert result["status"] == "canceled"
+    cancel_chase_order.assert_called_once_with("1234", "ETH/BTC")
+
+
+def test_get_order_id_conditional_uses_chase_child(default_conf, mocker):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+
+    assert (
+        exchange.get_order_id_conditional(
+            {"id": "chase-parent", "id_chase": "child-order", "type": "chase"}
+        )
+        == "child-order"
+    )
+    assert (
+        exchange.get_order_id_conditional({"id": "chase-parent", "type": "chase"}) == "chase-parent"
+    )
 
 
 @pytest.mark.parametrize("exchange_name", EXCHANGES)

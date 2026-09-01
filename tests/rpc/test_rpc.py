@@ -382,6 +382,7 @@ def test_rpc_delete_trade(mocker, default_conf, fee, markets, caplog, is_short):
     mocker.patch("freqtrade.rpc.telegram.Telegram", MagicMock())
     stoploss_mock = MagicMock()
     cancel_mock = MagicMock()
+    cancel_chase_mock = MagicMock()
     mocker.patch.multiple(
         EXMS,
         markets=PropertyMock(return_value=markets),
@@ -391,6 +392,7 @@ def test_rpc_delete_trade(mocker, default_conf, fee, markets, caplog, is_short):
     mocker.patch.multiple(
         freqtradebot.exchange,
         cancel_order=cancel_mock,
+        cancel_chase_order=cancel_chase_mock,
         cancel_stoploss_order=stoploss_mock,
     )
     freqtradebot.strategy.order_types["stoploss_on_exchange"] = True
@@ -400,6 +402,7 @@ def test_rpc_delete_trade(mocker, default_conf, fee, markets, caplog, is_short):
         rpc._rpc_delete("200")
 
     trades = Trade.session.scalars(select(Trade)).all()
+    trades[0].orders[0].order_type = "chase"
     trades[2].orders.append(
         Order(
             ft_order_side="stoploss",
@@ -418,9 +421,11 @@ def test_rpc_delete_trade(mocker, default_conf, fee, markets, caplog, is_short):
     assert res["result"] == "success"
     assert res["trade_id"] == "1"
     assert res["cancel_order_count"] == 1
-    assert cancel_mock.call_count == 1
+    assert cancel_chase_mock.call_count == 1
+    assert cancel_mock.call_count == 0
     assert stoploss_mock.call_count == 0
     cancel_mock.reset_mock()
+    cancel_chase_mock.reset_mock()
     stoploss_mock.reset_mock()
 
     res = rpc._rpc_delete("5")
@@ -443,6 +448,23 @@ def test_rpc_delete_trade(mocker, default_conf, fee, markets, caplog, is_short):
     res = rpc._rpc_delete("4")
     assert cancel_mock.call_count == 1
     assert stoploss_mock.call_count == 0
+
+
+def test_rpc_cancel_open_chase_order(mocker, default_conf, fee):
+    freqtradebot = get_patched_freqtradebot(mocker, default_conf)
+    create_mock_trades(fee)
+    trade = Trade.session.scalars(select(Trade).filter(Trade.id == 1)).one()
+    trade.orders[0].order_type = "chase"
+    order = {"id": trade.orders[0].order_id, "status": "open", "side": trade.entry_side}
+    fetch_mock = mocker.patch.object(
+        freqtradebot.exchange, "fetch_order_or_stoploss_order", return_value=order
+    )
+    cancel_mock = mocker.patch.object(freqtradebot, "handle_cancel_order")
+
+    RPC(freqtradebot)._rpc_cancel_open_order(trade.id)
+
+    fetch_mock.assert_called_once_with(trade.orders[0].order_id, trade.pair, order_type="chase")
+    cancel_mock.assert_called_once()
 
 
 def test_rpc_trade_statistics(default_conf_usdt, ticker, fee, mocker) -> None:
@@ -1109,6 +1131,61 @@ def test_rpc_force_exit(default_conf, ticker, fee, mocker) -> None:
     assert cancel_order_4.call_count == 1
     assert cancel_order_mock.call_count == 0
     assert pytest.approx(trade.amount) == amount
+
+
+def test_rpc_force_orders_do_not_inherit_chase(mocker, default_conf):
+    default_conf["force_entry_enable"] = True
+    freqtradebot = get_patched_freqtradebot(mocker, default_conf)
+    rpc = RPC(freqtradebot)
+    freqtradebot.strategy.order_types["entry"] = "chase"
+    freqtradebot.strategy.order_types["exit"] = "chase"
+    freqtradebot.strategy.order_types.pop("force_entry", None)
+    freqtradebot.strategy.order_types.pop("force_exit", None)
+    mocker.patch.object(freqtradebot.wallets, "get_trade_stake_amount", return_value=0.001)
+    execute_entry = mocker.patch.object(freqtradebot, "execute_entry", return_value=False)
+
+    with pytest.raises(RPCException, match="Failed to enter position"):
+        rpc._rpc_force_entry("ETH/BTC", None)
+    assert execute_entry.call_args.kwargs["ordertype"] == "limit"
+    with pytest.raises(RPCException, match="Chase orders are not supported for force entry"):
+        rpc._rpc_force_entry("ETH/BTC", None, order_type="chase")
+
+    trade = MagicMock(
+        open_orders=[],
+        has_open_orders=False,
+        pair="ETH/BTC",
+        is_short=False,
+        amount=1.0,
+    )
+    mocker.patch.object(freqtradebot.exchange, "get_rate", return_value=1.0)
+    execute_exit = mocker.patch.object(freqtradebot, "execute_trade_exit")
+
+    assert rpc._RPC__exec_force_exit(trade, None) is True
+    assert execute_exit.call_args.kwargs["ordertype"] == "limit"
+    with pytest.raises(RPCException, match="Chase orders are not supported for force exit"):
+        rpc._RPC__exec_force_exit(trade, "chase")
+
+
+def test_rpc_force_exit_fetches_persisted_chase_order(mocker, default_conf):
+    freqtradebot = get_patched_freqtradebot(mocker, default_conf)
+    rpc = RPC(freqtradebot)
+    open_order = MagicMock(order_id="parent-id", order_type="chase")
+    trade = MagicMock(
+        open_orders=[open_order],
+        has_open_orders=False,
+        pair="ETH/BTC",
+        entry_side="buy",
+        exit_side="sell",
+    )
+    fetch_mock = mocker.patch.object(
+        freqtradebot.exchange,
+        "fetch_order_or_stoploss_order",
+        return_value={"side": "buy"},
+    )
+    mocker.patch.object(freqtradebot, "handle_cancel_enter", return_value=True)
+
+    assert rpc._RPC__exec_force_exit(trade, None) is False
+    fetch_mock.assert_called_once_with("parent-id", "ETH/BTC", order_type="chase")
 
 
 def test_performance_handle(default_conf_usdt, ticker, fee, mocker) -> None:

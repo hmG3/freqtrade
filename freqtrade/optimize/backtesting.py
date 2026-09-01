@@ -1337,7 +1337,11 @@ class Backtesting:
             if oc:
                 # delete trade due to order timeout
                 return True
-            elif oc is None and self.check_order_replace(trade, order, current_time, row):
+            elif (
+                oc is None
+                and order.order_type != "chase"
+                and self.check_order_replace(trade, order, current_time, row)
+            ):
                 # delete trade due to user request
                 self.canceled_trade_entries += 1
                 return True

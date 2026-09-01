@@ -820,6 +820,17 @@ class Exchange:
         if any(v == "market" for k, v in order_types.items()):
             if not self.exchange_has("createMarketOrder"):
                 raise ConfigurationError(f"Exchange {self.name} does not support market orders.")
+        chase_slots = [key for key in ("entry", "exit") if order_types.get(key) == "chase"]
+        if chase_slots:
+            if (
+                not self._ft_has.get("chase_order", False)
+                or self.trading_mode != TradingMode.FUTURES
+                or self.margin_mode != MarginMode.ISOLATED
+            ):
+                raise ConfigurationError(f"Exchange {self.name} does not support chase orders.")
+            order_time_in_force = self._config.get("order_time_in_force", {})
+            if any(order_time_in_force.get(key, "GTC").upper() != "GTC" for key in chase_slots):
+                raise ConfigurationError("Chase orders require GTC time in force.")
         self.validate_stop_ordertypes(order_types)
 
     def validate_stop_ordertypes(self, order_types: dict) -> None:
@@ -1377,7 +1388,7 @@ class Exchange:
             return order
         if (
             order["status"] != "closed"
-            and order["type"] in ["limit"]
+            and order["type"] in ("limit", "chase")
             and not order.get("ft_order_type")
         ):
             pair = order["symbol"]
@@ -1480,14 +1491,17 @@ class Exchange:
             if not reduceOnly:
                 self._lev_prep(pair, leverage, side, accept_fail=not initial_order)
 
-            order = self._api.create_order(
-                pair,
-                ordertype,
-                side,
-                amount,
-                rate_for_order,
-                params,
-            )
+            if ordertype == "chase":
+                order = self.create_chase_order(pair, side, amount, rate_for_order, params)
+            else:
+                order = self._api.create_order(
+                    pair,
+                    ordertype,
+                    side,
+                    amount,
+                    rate_for_order,
+                    params,
+                )
             if order.get("status") is None or (
                 order.get("status") in ("closed", "expired")
                 and order.get("average") is None
@@ -1524,6 +1538,26 @@ class Exchange:
             ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
+
+    def create_chase_order(
+        self,
+        pair: str,
+        side: BuySell,
+        amount: float,
+        rate: float | None,
+        params: dict,
+    ) -> CcxtOrder:
+        raise OperationalException(f"Chase orders are not implemented for {self.name}.")
+
+    def fetch_chase_order(self, order_id: str, pair: str) -> CcxtOrder:
+        if self._config["dry_run"]:
+            return self.fetch_dry_run_order(order_id)
+        raise OperationalException(f"Chase orders are not implemented for {self.name}.")
+
+    def cancel_chase_order(self, order_id: str, pair: str) -> CcxtOrder:
+        if self._config["dry_run"]:
+            return self.cancel_order(order_id, pair)
+        raise OperationalException(f"Chase orders are not implemented for {self.name}.")
 
     def stoploss_adjust(self, stop_loss: float, order: CcxtOrder, side: str) -> bool:
         """
@@ -1766,7 +1800,11 @@ class Exchange:
         return order
 
     def fetch_order_or_stoploss_order(
-        self, order_id: str, pair: str, stoploss_order: bool = False
+        self,
+        order_id: str,
+        pair: str,
+        stoploss_order: bool = False,
+        order_type: str | None = None,
     ) -> CcxtOrder:
         """
         Simple wrapper calling either fetch_order or fetch_stoploss_order depending on
@@ -1774,9 +1812,12 @@ class Exchange:
         :param order_id: OrderId to fetch order
         :param pair: Pair corresponding to order_id
         :param stoploss_order: If true, uses fetch_stoploss_order, otherwise fetch_order.
+        :param order_type: Persisted order type. Routes chase orders to fetch_chase_order.
         """
         if stoploss_order:
             return self.fetch_stoploss_order(order_id, pair)
+        if order_type == "chase":
+            return self.fetch_chase_order(order_id, pair)
         return self.fetch_order(order_id, pair)
 
     def check_order_canceled_empty(self, order: CcxtOrder) -> bool:
@@ -1829,7 +1870,9 @@ class Exchange:
         required = ("fee", "status", "amount")
         return all(corder.get(k, None) is not None for k in required)
 
-    def cancel_order_with_result(self, order_id: str, pair: str, amount: float) -> CcxtOrder:
+    def cancel_order_with_result(
+        self, order_id: str, pair: str, amount: float, order_type: str | None = None
+    ) -> CcxtOrder:
         """
         Cancel order returning a result.
         Creates a fake result if cancel order returns a non-usable result
@@ -1837,16 +1880,21 @@ class Exchange:
         :param order_id: Orderid to cancel
         :param pair: Pair corresponding to order_id
         :param amount: Amount to use for fake response
+        :param order_type: Persisted order type. Routes chase orders to their native API.
         :return: Result from either cancel_order if usable, or fetch_order
         """
         try:
-            corder = self.cancel_order(order_id, pair)
+            corder = (
+                self.cancel_chase_order(order_id, pair)
+                if order_type == "chase"
+                else self.cancel_order(order_id, pair)
+            )
             if self.is_cancel_order_result_suitable(corder):
                 return corder
         except InvalidOrderException:
             logger.warning(f"Could not cancel order {order_id} for {pair}.")
         try:
-            order = self.fetch_order(order_id, pair)
+            order = self.fetch_order_or_stoploss_order(order_id, pair, order_type=order_type)
         except InvalidOrderException:
             logger.warning(f"Could not fetch cancelled order {order_id}.")
             order = {
@@ -2456,11 +2504,13 @@ class Exchange:
 
     def get_order_id_conditional(self, order: CcxtOrder) -> str:
         """
-        Return order id or id_stop (for conditional orders) based on exchange settings
+        Return the executable child id for native conditional orders, when available.
 
         :param order: ccxt order dict
         :return: correct order id
         """
+        if order.get("type") == "chase":
+            return safe_value_fallback(order, "id_chase", "id")
         if self.get_option("stoploss_query_requires_stop_flag") and (
             order["type"] in ("stoploss", "stop")
         ):

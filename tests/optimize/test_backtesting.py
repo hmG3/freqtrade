@@ -25,7 +25,7 @@ from freqtrade.exchange import timeframe_to_next_date, timeframe_to_prev_date
 from freqtrade.exchange.exchange_utils import DECIMAL_PLACES, TICK_SIZE
 from freqtrade.optimize.backtest_caching import get_backtest_metadata_filename, get_strategy_run_id
 from freqtrade.optimize.backtesting import DATE_IDX, HEADERS, Backtesting
-from freqtrade.persistence import LocalTrade, Trade
+from freqtrade.persistence import LocalTrade, Order, Trade
 from freqtrade.resolvers import StrategyResolver
 from freqtrade.util import dt_now, dt_utc
 from tests.conftest import (
@@ -44,6 +44,7 @@ from tests.conftest import (
 ORDER_TYPES = [
     {"entry": "limit", "exit": "limit", "stoploss": "limit", "stoploss_on_exchange": False},
     {"entry": "limit", "exit": "limit", "stoploss": "limit", "stoploss_on_exchange": True},
+    {"entry": "chase", "exit": "chase", "stoploss": "limit", "stoploss_on_exchange": False},
 ]
 
 
@@ -304,6 +305,18 @@ def test_backtesting_init(mocker, default_conf, order_types) -> None:
     assert backtesting.fee == 0.5
     assert not backtesting.strategy.order_types["stoploss_on_exchange"]
     assert backtesting.strategy.bot_started is True
+
+
+def test_backtesting_does_not_replace_chase_orders(mocker, default_conf) -> None:
+    patch_exchange(mocker)
+    backtesting = Backtesting(default_conf)
+    order = Order(ft_is_open=True, order_type="chase")
+    trade = MagicMock(orders=[order])
+    mocker.patch.object(backtesting, "check_order_cancel", return_value=None)
+    check_order_replace = mocker.patch.object(backtesting, "check_order_replace")
+
+    assert backtesting.manage_open_orders(trade, dt_now(), ()) is False
+    check_order_replace.assert_not_called()
 
 
 def test_backtesting_init_no_timeframe(mocker, default_conf, caplog) -> None:

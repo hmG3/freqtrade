@@ -7,6 +7,7 @@ from freqtrade.constants import BuySell
 from freqtrade.enums import CandleType, MarginMode, PriceType, TradingMode
 from freqtrade.exceptions import (
     DDosProtection,
+    InvalidOrderException,
     OperationalException,
     RetryableOrderError,
     TemporaryError,
@@ -35,6 +36,7 @@ class Okx(Exchange):
         "ws_enabled": True,
     }
     _ft_has_futures: FtHas = {
+        "chase_order": True,
         "tickers_have_quoteVolume": False,
         "stop_price_type_field": "slTriggerPxType",
         "stop_price_type_value_mapping": {
@@ -133,6 +135,149 @@ class Okx(Exchange):
             params["tdMode"] = self.margin_mode.value
             params["posSide"] = self._get_posSide(side, reduceOnly)
         return params
+
+    @staticmethod
+    def _chase_amount_to_string(amount: float) -> str:
+        return str(int(amount)) if float(amount).is_integer() else str(amount)
+
+    @staticmethod
+    def _get_chase_response_item(response: dict) -> dict:
+        if response.get("code") != "0":
+            raise ccxt.ExchangeError(response.get("msg") or str(response))
+        data = response.get("data") or []
+        if not data:
+            raise ccxt.OrderNotFound("Chase order response contained no order data.")
+        item = data[0]
+        if item.get("sCode") not in (None, "", "0"):
+            raise ccxt.InvalidOrder(item.get("sMsg") or str(item))
+        return item
+
+    def create_chase_order(
+        self,
+        pair: str,
+        side: BuySell,
+        amount: float,
+        rate: float | None,
+        params: dict,
+    ) -> CcxtOrder:
+        request = {
+            "instId": self.markets[pair]["id"],
+            "tdMode": params["tdMode"],
+            "side": side,
+            "posSide": params["posSide"],
+            "ordType": "chase",
+            "sz": self._chase_amount_to_string(amount),
+            "chaseType": "distance",
+            "chaseVal": "0",
+        }
+        if params.get("reduceOnly"):
+            request["reduceOnly"] = True
+
+        response = self._api.private_post_trade_order_algo(request)
+        self._log_exchange_response("create_chase_order", response)
+        item = self._get_chase_response_item(response)
+        order_id = str(item["algoId"])
+        return {
+            "id": order_id,
+            "symbol": pair,
+            "type": "chase",
+            "side": side,
+            "price": rate,
+            "average": None,
+            "amount": amount,
+            "filled": 0.0,
+            "remaining": amount,
+            "cost": 0.0,
+            "status": "open",
+            "fee": {},
+            "info": item,
+        }
+
+    def _normalize_chase_order(self, pair: str, item: dict) -> CcxtOrder:
+        amount = abs(float(item.get("sz") or 0.0))
+        filled = abs(float(item.get("actualSz") or 0.0))
+        remaining = max(amount - filled, 0.0)
+        average = float(item["actualPx"]) if item.get("actualPx") not in (None, "") else None
+        price = float(item["ordPx"]) if item.get("ordPx") not in (None, "") else average
+        state = str(item.get("state") or "").lower()
+        if state in ("live", "pause"):
+            status = "open"
+        elif state == "effective":
+            status = "closed"
+        elif state in ("canceled", "cancelled", "partially_effective", "partially_canceled"):
+            status = "canceled"
+        elif state in ("order_failed", "failed", "rejected"):
+            status = "rejected"
+        else:
+            status = "open"
+
+        order: CcxtOrder = {
+            "id": str(item["algoId"]),
+            "symbol": pair,
+            "type": "chase",
+            "side": item.get("side"),
+            "price": price,
+            "average": average,
+            "amount": amount,
+            "filled": filled,
+            "remaining": remaining,
+            "cost": filled * average if average is not None else 0.0,
+            "status": status,
+            "fee": {},
+            "info": item,
+        }
+        if item.get("ordId"):
+            order["id_chase"] = str(item["ordId"])
+        if item.get("cTime"):
+            order["timestamp"] = int(item["cTime"])
+        return self._order_contracts_to_amount(order)
+
+    @retrier(retries=API_RETRY_COUNT)
+    def fetch_chase_order(self, order_id: str, pair: str) -> CcxtOrder:
+        if self._config["dry_run"]:
+            return self.fetch_dry_run_order(order_id)
+        try:
+            response = self._api.private_get_trade_order_algo({"algoId": order_id})
+            self._log_exchange_response("fetch_chase_order", response)
+            return self._normalize_chase_order(pair, self._get_chase_response_item(response))
+        except ccxt.OrderNotFound as e:
+            raise RetryableOrderError(
+                f"Chase order not found (pair: {pair} id: {order_id}). Message: {e}"
+            ) from e
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(
+                f"Tried to get an invalid chase order (pair: {pair} id: {order_id}). Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get chase order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def cancel_chase_order(self, order_id: str, pair: str) -> CcxtOrder:
+        if self._config["dry_run"]:
+            return self.cancel_order(order_id, pair)
+        try:
+            response = self._api.private_post_trade_cancel_algos(
+                [{"algoId": order_id, "instId": self.markets[pair]["id"]}]
+            )
+            self._log_exchange_response("cancel_chase_order", response)
+            self._get_chase_response_item(response)
+            return self.fetch_chase_order(order_id, pair)
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(f"Could not cancel chase order. Message: {e}") from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not cancel chase order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
 
     def __fetch_leverage_already_set(self, pair: str, leverage: float, side: BuySell) -> bool:
         try:
@@ -286,6 +431,7 @@ class Myokx(Okx):
     Minimal adjustment to disable futures trading for the EU subsidiary of Okx
     """
 
+    _ft_has_futures: FtHas = {}
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
     ]
@@ -296,6 +442,7 @@ class Okxus(Okx):
     Minimal adjustment to disable futures trading for the US subsidiary of Okx
     """
 
+    _ft_has_futures: FtHas = {}
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
     ]

@@ -1027,11 +1027,16 @@ class RPC:
         amount: float | None = None,
         price: float | None = None,
     ) -> bool:
+        if ordertype == "chase":
+            raise RPCException("Chase orders are not supported for force exit.")
+
         # Check if there is there are open orders
         trade_entry_cancelation_registry = []
         for oo in trade.open_orders:
             trade_entry_cancelation_res = {"order_id": oo.order_id, "cancel_state": False}
-            order = self._freqtrade.exchange.fetch_order(oo.order_id, trade.pair)
+            order = self._freqtrade.exchange.fetch_order_or_stoploss_order(
+                oo.order_id, trade.pair, order_type=oo.order_type
+            )
 
             if order["side"] == trade.entry_side:
                 fully_canceled = self._freqtrade.handle_cancel_enter(
@@ -1061,6 +1066,8 @@ class RPC:
             order_type = ordertype or self._freqtrade.strategy.order_types.get(
                 "force_exit", self._freqtrade.strategy.order_types["exit"]
             )
+            if order_type == "chase":
+                order_type = "limit"
             sub_amount: float | None = None
             if amount and amount < trade.amount:
                 # Partial exit ...
@@ -1166,6 +1173,8 @@ class RPC:
         Buys a pair trade at the given or current price
         """
         self._force_entry_validations(pair, order_side)
+        if order_type == "chase":
+            raise RPCException("Chase orders are not supported for force entry.")
 
         # check if valid pair
 
@@ -1198,6 +1207,8 @@ class RPC:
             order_type = self._freqtrade.strategy.order_types.get(
                 "force_entry", self._freqtrade.strategy.order_types["entry"]
             )
+            if order_type == "chase":
+                order_type = "limit"
         with self._freqtrade._exit_lock:
             if self._freqtrade.execute_entry(
                 pair,
@@ -1236,7 +1247,9 @@ class RPC:
 
             for open_order in trade.open_orders:
                 try:
-                    order = self._freqtrade.exchange.fetch_order(open_order.order_id, trade.pair)
+                    order = self._freqtrade.exchange.fetch_order_or_stoploss_order(
+                        open_order.order_id, trade.pair, order_type=open_order.order_type
+                    )
                 except ExchangeError as e:
                     logger.info(f"Cannot query order for {trade} due to {e}.", exc_info=True)
                     raise RPCException("Order not found.")
@@ -1260,7 +1273,10 @@ class RPC:
             # Try cancelling regular order if that exists
             for open_order in trade.open_orders:
                 try:
-                    self._freqtrade.exchange.cancel_order(open_order.order_id, trade.pair)
+                    if open_order.order_type == "chase":
+                        self._freqtrade.exchange.cancel_chase_order(open_order.order_id, trade.pair)
+                    else:
+                        self._freqtrade.exchange.cancel_order(open_order.order_id, trade.pair)
                     c_count += 1
                 except ExchangeError:
                     pass

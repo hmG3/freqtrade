@@ -4,7 +4,13 @@ from typing import Annotated, Any, Literal
 from pydantic import AwareDatetime, BaseModel, Field, RootModel, SerializeAsAny, model_validator
 
 from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
-from freqtrade.enums import MarginMode, OrderTypeValues, SignalDirection, TradingMode
+from freqtrade.enums import (
+    EntryExitOrderTypeValues,
+    MarginMode,
+    OrderTypeValues,
+    SignalDirection,
+    TradingMode,
+)
 from freqtrade.ft_types import AnnotationType, ValidExchangesType
 from freqtrade.rpc.api_server.webserver_bgwork import JOB_CATEGORIES, ProgressTask
 
@@ -218,8 +224,8 @@ class UnfilledTimeout(BaseModel):
 
 
 class OrderTypes(BaseModel):
-    entry: OrderTypeValues
-    exit: OrderTypeValues
+    entry: EntryExitOrderTypeValues
+    exit: EntryExitOrderTypeValues
     emergency_exit: OrderTypeValues | None = None
     force_exit: OrderTypeValues | None = None
     force_entry: OrderTypeValues | None = None

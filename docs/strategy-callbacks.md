@@ -681,6 +681,8 @@ class AwesomeStrategy(IStrategy):
     **Example**:
     If the new_entryprice is 97, the proposed_rate is 100 and the `custom_price_max_distance_ratio` is set to 2%, The retained valid custom entry price will be 98, which is 2% below the current (proposed) rate.
 
+    Native `chase` orders do not use custom entry or exit prices in live trading. The exchange selects and continuously updates the executable child-order price. Simulated modes use Freqtrade's calculated reference rate with limit-order fill rules.
+
 !!! Warning "Backtesting"
     Custom prices are supported in backtesting (starting with 2021.12), and orders will fill if the price falls within the candle's low/high range.
     Orders that don't fill immediately are subject to regular timeout handling, which happens once per (detail) candle.
@@ -1081,6 +1083,8 @@ class DigDeeperStrategy(IStrategy):
 The `adjust_order_price()` callback may be used by strategy developer to refresh/replace limit orders upon arrival of new candles.  
 This callback is called once every iteration unless the order has been (re)placed within the current candle - limiting the maximum (re)placement of each order to once per candle.
 This also means that the first call will be at the start of the next candle after the initial order was placed.
+
+This callback and the split `adjust_entry_price()` / `adjust_exit_price()` callbacks are not called for native `chase` orders. Repricing is managed by the exchange; configured timeout callbacks can still cancel the parent chase order.
 
 Be aware that `custom_entry_price()`/`custom_exit_price()` is still the one dictating initial limit order price target at the time of the signal.
 

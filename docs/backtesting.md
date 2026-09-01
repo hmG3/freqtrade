@@ -560,6 +560,7 @@ Since backtesting lacks some detailed information about what happens within a ca
 - Exchange [trading limits](#trading-limits-in-backtesting) are respected
 - Entries happen at open-price unless a custom price logic has been specified
 - All orders are filled at the requested price (no slippage) as long as the price is within the candle's high/low range
+- Native chase orders are simulated as limit orders at Freqtrade's calculated reference rate; exchange-side best-price repricing is not reproduced
 - Exit-signal exits happen at open-price of the consecutive candle
 - Exits free their trade slot for a new trade with a different pair
 - Exit-signal is favored over Stoploss, because exit-signals are assumed to trigger on candle's open

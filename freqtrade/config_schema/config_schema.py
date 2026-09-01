@@ -7,6 +7,7 @@ from freqtrade.constants import (
     BACKTEST_BREAKDOWNS,
     BACKTEST_CACHE_AGE,
     DRY_RUN_WALLET,
+    ENTRY_EXIT_ORDERTYPE_POSSIBILITIES,
     EXPORT_OPTIONS,
     HYPEROPT_LOSS_BUILTIN,
     MARGIN_MODES,
@@ -435,14 +436,14 @@ CONF_SCHEMA = {
             "type": "object",
             "properties": {
                 "entry": {
-                    "description": "Order type for entry (e.g., limit, market).",
+                    "description": "Order type for entry (limit, market, or chase).",
                     "type": "string",
-                    "enum": ORDERTYPE_POSSIBILITIES,
+                    "enum": ENTRY_EXIT_ORDERTYPE_POSSIBILITIES,
                 },
                 "exit": {
-                    "description": "Order type for exit (e.g., limit, market).",
+                    "description": "Order type for exit (limit, market, or chase).",
                     "type": "string",
-                    "enum": ORDERTYPE_POSSIBILITIES,
+                    "enum": ENTRY_EXIT_ORDERTYPE_POSSIBILITIES,
                 },
                 "force_exit": {
                     "description": "Order type for forced exit (e.g., limit, market).",

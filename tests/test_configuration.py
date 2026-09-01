@@ -657,6 +657,25 @@ def test_validate_default_conf(default_conf) -> None:
     validate_config_schema(default_conf)
 
 
+def test_validate_chase_order_type_schema(default_conf) -> None:
+    default_conf["order_types"] = {
+        "entry": "chase",
+        "exit": "chase",
+        "emergency_exit": "market",
+        "force_entry": "limit",
+        "force_exit": "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": False,
+    }
+    validate_config_schema(default_conf)
+
+    for restricted_order_type in ("force_entry", "force_exit", "emergency_exit", "stoploss"):
+        conf = deepcopy(default_conf)
+        conf["order_types"][restricted_order_type] = "chase"
+        with pytest.raises(ConfigurationError):
+            validate_config_schema(conf)
+
+
 @pytest.mark.parametrize("fiat", ["EUR", "USD", "", None])
 def test_validate_fiat_currency_options(default_conf, fiat) -> None:
     # Validate via our validator - we allow setting defaults!

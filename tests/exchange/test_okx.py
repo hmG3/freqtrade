@@ -5,7 +5,7 @@ import ccxt
 import pytest
 
 from freqtrade.enums import CandleType, MarginMode, TradingMode
-from freqtrade.exceptions import RetryableOrderError, TemporaryError
+from freqtrade.exceptions import InvalidOrderException, RetryableOrderError, TemporaryError
 from freqtrade.exchange.common import API_RETRY_COUNT
 from freqtrade.exchange.exchange import timeframe_to_minutes
 from tests.conftest import EXMS, get_patched_exchange, log_has
@@ -757,3 +757,197 @@ def test_fetch_orders_okx(default_conf, mocker, limit_order):
     assert api_mock.fetch_closed_orders.call_count == 2
     assert "params" not in api_mock.fetch_closed_orders.call_args_list[0][1]
     assert api_mock.fetch_closed_orders.call_args_list[1][1]["params"] == history_params
+
+
+@pytest.mark.parametrize(
+    ("net_only", "side", "reduce_only", "position_side"),
+    [
+        (True, "sell", True, "net"),
+        (False, "buy", False, "long"),
+        (False, "sell", False, "short"),
+        (False, "sell", True, "long"),
+        (False, "buy", True, "short"),
+    ],
+)
+def test_create_chase_order_okx(
+    default_conf, mocker, markets, net_only, side, reduce_only, position_side
+):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_post_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [{"algoId": "12345", "sCode": "0", "sMsg": ""}],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+    exchange.net_only = net_only
+    mocker.patch.object(exchange, "_lev_prep")
+
+    order = exchange.create_order(
+        pair="ETH/USDT:USDT",
+        ordertype="chase",
+        side=side,
+        amount=20.0,
+        rate=2500.0,
+        leverage=3.0,
+        reduceOnly=reduce_only,
+    )
+
+    expected_request = {
+        "instId": "ETH-USDT-SWAP",
+        "tdMode": "isolated",
+        "side": side,
+        "posSide": position_side,
+        "ordType": "chase",
+        "sz": "2",
+        "chaseType": "distance",
+        "chaseVal": "0",
+    }
+    if reduce_only:
+        expected_request["reduceOnly"] = True
+    api_mock.private_post_trade_order_algo.assert_called_once_with(expected_request)
+    assert order == {
+        "id": "12345",
+        "symbol": "ETH/USDT:USDT",
+        "type": "chase",
+        "side": side,
+        "price": 2500.0,
+        "average": None,
+        "amount": 20.0,
+        "filled": 0.0,
+        "remaining": 20.0,
+        "cost": 0.0,
+        "status": "open",
+        "fee": {},
+        "info": {"algoId": "12345", "sCode": "0", "sMsg": ""},
+    }
+
+
+def test_fetch_chase_order_okx_normalizes_parent_and_child(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "67890",
+                "instId": "ETH-USDT-SWAP",
+                "state": "effective",
+                "side": "buy",
+                "sz": "2",
+                "actualSz": "2",
+                "actualPx": "2501.5",
+                "cTime": "1710000000000",
+            }
+        ],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+
+    api_mock.private_get_trade_order_algo.assert_called_once_with({"algoId": "12345"})
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["type"] == "chase"
+    assert order["status"] == "closed"
+    assert order["amount"] == 20.0
+    assert order["filled"] == 20.0
+    assert order["remaining"] == 0.0
+    assert order["average"] == 2501.5
+
+
+def test_cancel_chase_order_okx(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_post_trade_cancel_algos.return_value = {
+        "code": "0",
+        "data": [{"algoId": "12345", "sCode": "0", "sMsg": ""}],
+        "msg": "",
+    }
+    api_mock.private_get_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [
+            {
+                "algoId": "12345",
+                "ordId": "67890",
+                "state": "partially_effective",
+                "side": "sell",
+                "sz": "2",
+                "actualSz": "1",
+                "actualPx": "2501.5",
+            }
+        ],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+
+    order = exchange.cancel_chase_order("12345", "ETH/USDT:USDT")
+
+    api_mock.private_post_trade_cancel_algos.assert_called_once_with(
+        [{"algoId": "12345", "instId": "ETH-USDT-SWAP"}]
+    )
+    assert order["id"] == "12345"
+    assert order["id_chase"] == "67890"
+    assert order["status"] == "canceled"
+    assert order["filled"] == 10.0
+    assert order["remaining"] == 10.0
+
+
+def test_create_chase_order_okx_rejects_item_error(default_conf, mocker, markets):
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    market = markets["ETH/USDT:USDT"] | {"id": "ETH-USDT-SWAP", "future": False}
+    api_mock = MagicMock()
+    api_mock.private_post_trade_order_algo.return_value = {
+        "code": "0",
+        "data": [{"algoId": "", "sCode": "51000", "sMsg": "Invalid chase order"}],
+        "msg": "",
+    }
+    exchange = get_patched_exchange(
+        mocker,
+        default_conf,
+        api_mock=api_mock,
+        exchange="okx",
+        mock_markets={"ETH/USDT:USDT": market},
+    )
+    mocker.patch.object(exchange, "_lev_prep")
+
+    with pytest.raises(InvalidOrderException, match="Invalid chase order"):
+        exchange.create_order(
+            pair="ETH/USDT:USDT",
+            ordertype="chase",
+            side="buy",
+            amount=20.0,
+            rate=2500.0,
+            leverage=3.0,
+        )

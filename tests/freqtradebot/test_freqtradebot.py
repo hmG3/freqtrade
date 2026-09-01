@@ -1390,6 +1390,96 @@ def test_update_trade_state(mocker, default_conf_usdt, limit_order, is_short, ca
     assert freqtrade.strategy.order_filled.call_count == 0
 
 
+def test_update_trade_state_routes_persisted_chase_order(mocker, default_conf_usdt) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    fetch_order = mocker.patch(
+        f"{EXMS}.fetch_order_or_stoploss_order",
+        return_value={
+            "id": "chase-parent",
+            "symbol": "ETH/USDT",
+            "type": "chase",
+            "side": "buy",
+            "price": 2.0,
+            "average": None,
+            "amount": 1.0,
+            "filled": 0.0,
+            "remaining": 1.0,
+            "cost": 0.0,
+            "status": "canceled",
+            "fee": {},
+            "info": {},
+        },
+    )
+    trade = Trade(
+        pair="ETH/USDT",
+        amount=1.0,
+        exchange="okx",
+        open_rate=2.0,
+        open_date=dt_now(),
+        fee_open=0.001,
+        fee_close=0.001,
+        is_open=True,
+        leverage=1.0,
+    )
+    trade.orders.append(
+        Order(
+            ft_order_side="buy",
+            ft_pair=trade.pair,
+            ft_is_open=True,
+            ft_amount=1.0,
+            ft_price=2.0,
+            order_id="chase-parent",
+            order_type="chase",
+            status="open",
+            side="buy",
+            price=2.0,
+            amount=1.0,
+            filled=0.0,
+            remaining=1.0,
+        )
+    )
+
+    assert freqtrade.update_trade_state(trade, "chase-parent") is True
+    fetch_order.assert_called_once_with("chase-parent", "ETH/USDT", False, order_type="chase")
+
+
+def test_replace_order_skips_native_chase(default_conf_usdt, mocker) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    get_analyzed_dataframe = mocker.patch.object(freqtrade.dataprovider, "get_analyzed_dataframe")
+    order_obj = MagicMock(order_type="chase")
+
+    freqtrade.replace_order({"status": "open"}, order_obj, MagicMock())
+
+    get_analyzed_dataframe.assert_not_called()
+
+
+def test_chase_entry_ignores_custom_entry_price(default_conf_usdt, mocker) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    mocker.patch.object(freqtrade.exchange, "get_rate", return_value=2.0)
+    mocker.patch.object(freqtrade.exchange, "get_min_pair_stake_amount", return_value=0.0)
+    mocker.patch.object(freqtrade.exchange, "get_max_pair_stake_amount", return_value=100.0)
+    mocker.patch.object(freqtrade.wallets, "get_available_stake_amount", return_value=100.0)
+    mocker.patch.object(freqtrade.wallets, "validate_stake_amount", return_value=10.0)
+    custom_entry_price = mocker.patch.object(
+        freqtrade.strategy, "custom_entry_price", return_value=3.0
+    )
+
+    rate, _, _ = freqtrade.get_valid_enter_price_and_stake(
+        "ETH/USDT",
+        None,
+        10.0,
+        "long",
+        None,
+        None,
+        "initial",
+        None,
+        order_type="chase",
+    )
+
+    assert rate == 2.0
+    custom_entry_price.assert_not_called()
+
+
 @pytest.mark.parametrize("is_short", [False, True])
 @pytest.mark.parametrize("initial_amount,has_rounding_fee", [(30.0 + 1e-14, True), (8.0, False)])
 def test_update_trade_state_withorderdict(

@@ -440,7 +440,10 @@ class FreqtradeBot(LoggingMixin):
         for order in orders:
             try:
                 fo = self.exchange.fetch_order_or_stoploss_order(
-                    order.order_id, order.ft_pair, order.ft_order_side == "stoploss"
+                    order.order_id,
+                    order.ft_pair,
+                    order.ft_order_side == "stoploss",
+                    order_type=order.order_type,
                 )
                 if not order.trade:
                     # This should not happen, but it does if trades were deleted manually.
@@ -529,7 +532,10 @@ class FreqtradeBot(LoggingMixin):
                 continue
             try:
                 fo = self.exchange.fetch_order_or_stoploss_order(
-                    order.order_id, order.ft_pair, order.ft_order_side == "stoploss"
+                    order.order_id,
+                    order.ft_pair,
+                    order.ft_order_side == "stoploss",
+                    order_type=order.order_type,
                 )
                 if fo:
                     logger.info(f"Found {order} for trade {trade}.")
@@ -934,7 +940,7 @@ class FreqtradeBot(LoggingMixin):
     ) -> bool:
         """
         Executes an entry for the given pair
-        :param pair: pair for which we want to create a LIMIT order
+        :param pair: pair for which we want to create an entry order
         :param stake_amount: amount of stake-currency for the pair
         :return: True if an entry order is created, False if it fails.
         :raise: DependencyException or it's subclasses like ExchangeError.
@@ -945,9 +951,10 @@ class FreqtradeBot(LoggingMixin):
         name = "Short" if is_short else "Long"
         trade_side: LongShort = "short" if is_short else "long"
         pos_adjust = trade is not None
+        order_type = ordertype or self.strategy.order_types["entry"]
 
         enter_limit_requested, stake_amount, leverage = self.get_valid_enter_price_and_stake(
-            pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_
+            pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_, order_type
         )
 
         if not stake_amount:
@@ -967,8 +974,6 @@ class FreqtradeBot(LoggingMixin):
         )
         logger.info(msg)
         amount = (stake_amount / enter_limit_requested) * leverage
-        order_type = ordertype or self.strategy.order_types["entry"]
-
         if mode == "initial" and not strategy_safe_wrapper(
             self.strategy.confirm_trade_entry, default_retval=True
         )(
@@ -1152,6 +1157,7 @@ class FreqtradeBot(LoggingMixin):
         trade: Trade | None,
         mode: EntryExecuteMode,
         leverage_: float | None,
+        order_type: str,
     ) -> tuple[float, float, float]:
         """
         Validate and eventually adjust (within limits) limit, amount and leverage
@@ -1165,8 +1171,8 @@ class FreqtradeBot(LoggingMixin):
             enter_limit_requested = self.exchange.get_rate(
                 pair, side="entry", is_short=(trade_side == "short"), refresh=True
             )
-        if mode != "replace":
-            # Don't call custom_entry_price in order-adjust scenario
+        if mode != "replace" and order_type != "chase":
+            # Replacement and native chase orders keep their calculated reference price.
             custom_entry_price = strategy_safe_wrapper(
                 self.strategy.custom_entry_price, default_retval=enter_limit_requested
             )(
@@ -1637,7 +1643,9 @@ class FreqtradeBot(LoggingMixin):
             open_order: Order
             for open_order in trade.open_orders:
                 try:
-                    order = self.exchange.fetch_order(open_order.order_id, trade.pair)
+                    order = self.exchange.fetch_order_or_stoploss_order(
+                        open_order.order_id, trade.pair, order_type=open_order.order_type
+                    )
 
                 except ExchangeError:
                     logger.info(
@@ -1728,6 +1736,9 @@ class FreqtradeBot(LoggingMixin):
         :param trade: Trade object.
         :return: None
         """
+        if order_obj.order_type == "chase":
+            return
+
         analyzed_df, _ = self.dataprovider.get_analyzed_dataframe(
             trade.pair, self.strategy.timeframe
         )
@@ -1791,7 +1802,9 @@ class FreqtradeBot(LoggingMixin):
         places a new order with the remaining capital.
         """
         if not order:
-            order = self.exchange.fetch_order(order_obj.order_id, trade.pair)
+            order = self.exchange.fetch_order_or_stoploss_order(
+                order_obj.order_id, trade.pair, order_type=order_obj.order_type
+            )
         res = self.handle_cancel_order(order, order_obj, trade, cancel_reason, replacing=replacing)
         if not res:
             self.replace_order_failed(
@@ -1842,7 +1855,9 @@ class FreqtradeBot(LoggingMixin):
 
         for open_order in trade.open_orders:
             try:
-                order = self.exchange.fetch_order(open_order.order_id, trade.pair)
+                order = self.exchange.fetch_order_or_stoploss_order(
+                    open_order.order_id, trade.pair, order_type=open_order.order_type
+                )
             except ExchangeError:
                 logger.info("Can't query order for %s due to %s", trade, traceback.format_exc())
                 continue
@@ -1934,7 +1949,9 @@ class FreqtradeBot(LoggingMixin):
                         f"as the filled amount of {filled_val} would result in an unexitable trade."
                     )
                     return False
-            corder = self.exchange.cancel_order_with_result(order_id, trade.pair, trade.amount)
+            corder = self.exchange.cancel_order_with_result(
+                order_id, trade.pair, trade.amount, order_type=order_obj.order_type
+            )
             order_obj.ft_cancel_reason = reason
             # if replacing, retry fetching the order 3 times if the status is not what we need
             if replacing:
@@ -1944,7 +1961,9 @@ class FreqtradeBot(LoggingMixin):
                     and retry_count < 3
                 ):
                     sleep(0.5)
-                    corder = self.exchange.fetch_order(order_id, trade.pair)
+                    corder = self.exchange.fetch_order_or_stoploss_order(
+                        order_id, trade.pair, order_type=order_obj.order_type
+                    )
                     retry_count += 1
 
             # Avoid race condition where the order could not be cancelled coz its already filled.
@@ -2034,7 +2053,7 @@ class FreqtradeBot(LoggingMixin):
             order_obj.ft_cancel_reason = reason
             try:
                 order = self.exchange.cancel_order_with_result(
-                    order["id"], trade.pair, trade.amount
+                    order["id"], trade.pair, trade.amount, order_type=order_obj.order_type
                 )
             except InvalidOrderException:
                 logger.exception(f"Could not cancel {trade.exit_side} order {order_id}")
@@ -2385,12 +2404,15 @@ class FreqtradeBot(LoggingMixin):
             logger.warning(f"Orderid for trade {trade} is empty.")
             return False
 
+        order_obj_or_none = trade.select_order_by_order_id(order_id)
+        order_obj = self.order_obj_or_raise(order_id, order_obj_or_none)
+
         # Update trade with order values
         if not stoploss_order:
             logger.info(f"Found open order for {trade}")
         try:
             order = action_order or self.exchange.fetch_order_or_stoploss_order(
-                order_id, trade.pair, stoploss_order
+                order_id, trade.pair, stoploss_order, order_type=order_obj.order_type
             )
         except InvalidOrderException as exception:
             logger.warning("Unable to fetch order %s: %s", order_id, exception)
@@ -2402,9 +2424,6 @@ class FreqtradeBot(LoggingMixin):
             # Trade has been cancelled on exchange
             # Handling of this will happen in handle_cancel_order.
             return True
-
-        order_obj_or_none = trade.select_order_by_order_id(order_id)
-        order_obj = self.order_obj_or_raise(order_id, order_obj_or_none)
 
         self.handle_order_fee(trade, order_obj, order)
 
