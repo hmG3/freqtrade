@@ -1,4 +1,5 @@
 numpy==2.4.6
+numba==0.65.1
 pandas==3.0.5
 bottleneck==1.6.0
 numexpr==2.14.2
