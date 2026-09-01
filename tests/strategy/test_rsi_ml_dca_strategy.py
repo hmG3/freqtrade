@@ -19,7 +19,7 @@ from user_data.strategies.rsi_ml_dca_strategy import (
 def _strategy() -> RSIMLDCAStrategy:
     strategy = RSIMLDCAStrategy({})
     strategy.tp_atr_mult.value = 3.0
-    strategy.leverage_tier.value = 3
+    strategy.leverage_buffer_pct.value = 5.0
     return strategy
 
 
@@ -96,7 +96,7 @@ def _ohlcv_dataframe(
         (True, -1),
     ],
 )
-def test_take_profit_requires_fresh_rsi_cross_and_atr_profit(
+def test_take_profit_requires_rsi_target_and_atr_profit(
     is_short: bool,
     tp_signal: int,
 ) -> None:
@@ -137,7 +137,7 @@ def test_take_profit_requires_fresh_rsi_cross_and_atr_profit(
     ) == (-trade.stake_amount, strategy.TAKE_PROFIT_EXIT_TAG)
 
 
-def test_take_profit_does_not_latch_rsi_cross() -> None:
+def test_take_profit_rechecks_active_rsi_target_on_later_candle() -> None:
     strategy = _strategy()
     trade = _trade(False)
     trade.id = 902
@@ -156,54 +156,12 @@ def test_take_profit_does_not_latch_rsi_cross() -> None:
     assert strategy._take_profit_adjustment(trade, candle, candle["date"], 100.0) is None
 
     candle["date"] = datetime(2026, 7, 3, 6, 45, tzinfo=UTC)
-    candle["tp_signal"] = 0
-    assert strategy._take_profit_adjustment(trade, candle, candle["date"], tp_target_rate) is None
-
-
-def test_signal_stop_loss_requires_completed_ladder_same_direction_and_atr_distance(
-    caplog,
-    monkeypatch,
-) -> None:
-    strategy = _strategy()
-    monkeypatch.setattr(strategy.max_safe_orders, "value", 1)
-    monkeypatch.setattr(strategy.so_atr_mult, "value", 2.0)
-    monkeypatch.setattr(strategy.use_signal_stop_loss, "value", True)
-    trade = _trade(False)
-    trade.id = 903
-    _add_filled_entries(trade, (100.0, 97.0))
-    candle = Series(
-        {
-            "date": datetime(2026, 7, 3, 6, 44, tzinfo=UTC),
-            "close": 95.0,
-            "atr": 1.0,
-            "sl_signal": 1,
-        }
-    )
-
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.rsi_ml_dca_strategy"):
-        adjustment = strategy._signal_stop_loss_adjustment(trade, candle)
-
-    assert adjustment == (-trade.stake_amount, strategy.SIGNAL_STOP_LOSS_EXIT_TAG)
-    assert [record.getMessage() for record in caplog.records] == [
-        "Signal SL | #903 ETH/USDT:USDT long | 2026-07-03 06:44 | close 95 | "
-        "required <= 95 | last entry 97 | ATR distance 1 x2 = 2"
-    ]
-
-    candle["close"] = 95.1
-    assert strategy._signal_stop_loss_adjustment(trade, candle) is None
-
-    candle["close"] = 95.0
-    candle["sl_signal"] = -1
-    assert strategy._signal_stop_loss_adjustment(trade, candle) is None
-
-    incomplete_trade = _trade(False)
-    incomplete_trade.id = 905
-    _add_filled_entries(incomplete_trade, (100.0,))
-    candle["sl_signal"] = 1
-    assert strategy._signal_stop_loss_adjustment(incomplete_trade, candle) is None
-
-    strategy.use_signal_stop_loss.value = False
-    assert strategy._signal_stop_loss_adjustment(trade, candle) is None
+    assert strategy._take_profit_adjustment(
+        trade,
+        candle,
+        candle["date"],
+        tp_target_rate,
+    ) == (-trade.stake_amount, strategy.TAKE_PROFIT_EXIT_TAG)
 
 
 def test_take_profit_skips_unavailable_atr() -> None:
@@ -282,8 +240,8 @@ def test_emergency_break_even_precedes_dataframe_exits_and_logs_target(
 
     assert adjustment == (-trade.stake_amount, strategy.EMERGENCY_BREAK_EVEN_EXIT_TAG)
     assert [record.getMessage() for record in caplog.records] == [
-        "Emergency BE limit | #907 ETH/USDT:USDT long | 2026-08-17 00:00 | "
-        f"target {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
+        "Emergency BE | #907 ETH/USDT:USDT long | 2026-08-17 00:00 | "
+        f"limit {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
     ]
 
 
@@ -348,13 +306,11 @@ def test_higher_filter_rsi_timeframe_filters_base_timeframe_engine() -> None:
         entry_engine,
         entry_filter_avg_rsi,
         exit_engine,
-        sl_engine,
     ) = strategy._RSIMLDCAStrategy__prepare_rsi_engines(
         dataframe=dataframe,
         metadata={"pair": "ETH/USDT:USDT"},
         entry_filter_timeframe="5m",
         exit_timeframe="1m",
-        sl_timeframe="5m",
         entry_min_length=2,
         entry_max_length=3,
         exit_min_length=2,
@@ -374,8 +330,6 @@ def test_higher_filter_rsi_timeframe_filters_base_timeframe_engine() -> None:
 
     assert np.allclose(entry_engine[0], expected_entry_engine[0], equal_nan=True)
     assert np.allclose(exit_engine[0], expected_entry_engine[0], equal_nan=True)
-    assert np.isnan(sl_engine[0][:4]).all()
-    assert np.allclose(sl_engine[0][4:9], expected_filter_avg[0])
     assert entry_filter_avg_rsi is not None
     assert np.isnan(entry_filter_avg_rsi[:4]).all()
     assert np.allclose(entry_filter_avg_rsi[4:9], expected_filter_avg[0])
@@ -389,32 +343,28 @@ def test_base_filter_rsi_timeframe_disables_filter() -> None:
     close = 100.0 + np.sin(np.arange(30, dtype=np.float64) / 2.0)
     dataframe = _ohlcv_dataframe(close)
 
-    _, entry_engine, entry_filter_avg_rsi, _, sl_engine = (
-        strategy._RSIMLDCAStrategy__prepare_rsi_engines(
-            dataframe=dataframe,
-            metadata={"pair": "ETH/USDT:USDT"},
-            entry_filter_timeframe="1m",
-            exit_timeframe="1m",
-            sl_timeframe="1m",
-            entry_min_length=2,
-            entry_max_length=3,
-            exit_min_length=2,
-            exit_max_length=3,
-            overbought=70.0,
-            oversold=30.0,
-        )
+    _, entry_engine, entry_filter_avg_rsi, _ = strategy._RSIMLDCAStrategy__prepare_rsi_engines(
+        dataframe=dataframe,
+        metadata={"pair": "ETH/USDT:USDT"},
+        entry_filter_timeframe="1m",
+        exit_timeframe="1m",
+        entry_min_length=2,
+        entry_max_length=3,
+        exit_min_length=2,
+        exit_max_length=3,
+        overbought=70.0,
+        oversold=30.0,
     )
 
     expected_entry_avg = calc_rsi_ml_nb(close, 2, 3, 70.0, 30.0)[0]
     assert np.allclose(entry_engine[0], expected_entry_avg, equal_nan=True)
-    assert np.allclose(sl_engine[0], expected_entry_avg, equal_nan=True)
     assert entry_filter_avg_rsi is None
 
 
 def test_filter_rsi_timeframe_registers_informative_pair() -> None:
     strategy = _strategy()
     strategy.filter_rsi_timeframe = "5m"
-    strategy.signal_stop_loss_timeframe = "15m"
+    strategy.exit_rsi_timeframe = "15m"
     strategy.dp = SimpleNamespace(current_whitelist=lambda: ["ETH/USDT:USDT"])
 
     assert strategy.informative_pairs() == [
@@ -458,7 +408,6 @@ def test_higher_timeframe_average_rsi_gates_entry_signals(
         entry_engine=entry_engine,
         entry_filter_avg_rsi=entry_filter_avg_rsi,
         exit_engine=exit_engine,
-        sl_engine=entry_engine,
         entry_length_count=1,
         overbought=70.0,
         oversold=30.0,
@@ -470,23 +419,23 @@ def test_higher_timeframe_average_rsi_gates_entry_signals(
     assert result["signal"].tolist() == expected_signal
 
 
-def test_populate_indicators_uses_fresh_exit_rsi_crosses_for_take_profit() -> None:
+def test_populate_indicators_uses_outward_moving_exit_rsi_bands_for_take_profit() -> None:
     strategy = _strategy()
-    dataframe = _ohlcv_dataframe(np.full(6, 100.0, dtype=np.float64))
-    average = np.full(6, 50.0, dtype=np.float64)
+    dataframe = _ohlcv_dataframe(np.full(9, 100.0, dtype=np.float64))
+    average = np.full(9, 50.0, dtype=np.float64)
     entry_engine = (
         average,
         average.copy(),
         average.copy(),
-        np.zeros(6, dtype=np.int16),
-        np.zeros(6, dtype=np.int16),
+        np.zeros(9, dtype=np.int16),
+        np.zeros(9, dtype=np.int16),
     )
     exit_engine = (
-        np.array([50.0, 69.0, 71.0, 72.0, 31.0, 29.0]),
-        np.full(6, 70.0),
-        np.full(6, 30.0),
-        np.zeros(6, dtype=np.int16),
-        np.zeros(6, dtype=np.int16),
+        np.array([50.0, 71.0, 72.0, 73.0, 73.9, 29.0, 28.0, 27.0, 26.1]),
+        np.array([70.0, 71.0, 72.0, 72.0, 72.9, 72.9, 72.9, 72.9, 72.9]),
+        np.array([30.0, 30.0, 30.0, 30.0, 30.0, 29.0, 28.0, 28.0, 27.1]),
+        np.zeros(9, dtype=np.int16),
+        np.zeros(9, dtype=np.int16),
     )
 
     result = strategy._RSIMLDCAStrategy__populate_rsi_ml_dca(
@@ -494,7 +443,6 @@ def test_populate_indicators_uses_fresh_exit_rsi_crosses_for_take_profit() -> No
         entry_engine=entry_engine,
         entry_filter_avg_rsi=None,
         exit_engine=exit_engine,
-        sl_engine=entry_engine,
         entry_length_count=1,
         overbought=70.0,
         oversold=30.0,
@@ -503,7 +451,7 @@ def test_populate_indicators_uses_fresh_exit_rsi_crosses_for_take_profit() -> No
         atr_length=2,
     )
 
-    assert result["tp_signal"].tolist() == [0, 0, 1, 0, 0, -1]
+    assert result["tp_signal"].tolist() == [0, 1, 1, 0, 0, -1, -1, 0, 0]
 
 
 def test_populate_indicators_keeps_only_callback_and_plot_columns() -> None:
@@ -536,9 +484,7 @@ def test_populate_indicators_keeps_only_callback_and_plot_columns() -> None:
         "oversell_zone",
         "signal",
         "tp_signal",
-        "sl_signal",
     } <= set(result.columns)
-    assert "signal_stop_signal" not in result.columns
     assert "long_tp_arm" not in result.columns
     assert "short_tp_arm" not in result.columns
     assert "so_atr" not in result.columns
@@ -611,6 +557,8 @@ def test_custom_stake_logs_requested_stake_without_trade_id(caplog) -> None:
             "stake_currency": "USDT",
         }
     )
+    strategy.vol_scale.value = 2.0
+    strategy.max_safe_orders.value = 5
 
     with caplog.at_level(
         logging.INFO,
@@ -631,7 +579,8 @@ def test_custom_stake_logs_requested_stake_without_trade_id(caplog) -> None:
     assert stake == pytest.approx(1130.81668108 / 63.0)
     assert [record.getMessage() for record in caplog.records] == [
         "Initial stake requested | DOGE/USDT:USDT long | 2026-07-24 21:22 | "
-        "17.949 USDT | DCA budget 1130.817 USDT / multiplier 63"
+        "17.949 USDT | DCA budget 1130.817 USDT ÷ DCA factor 63 "
+        "(∑ 1 + 2 + 4 + 8 + 16 + 32)"
     ]
 
 
@@ -784,6 +733,197 @@ def test_initial_fill_does_not_consume_a_post_order_signal() -> None:
     assert trade.get_custom_data(strategy.LAST_DCA_SIGNAL_KEY) is None
 
 
+def test_safety_order_fill_preserves_decision_signal(monkeypatch) -> None:
+    strategy = RSIMLDCAStrategy({"stake_currency": "USDT"})
+    trade = _trade(False)
+    trade.id = 44
+    _add_filled_entries(trade, (100.0, 98.0))
+    decision_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    custom_data = {strategy.LAST_DCA_SIGNAL_KEY: str(decision_time)}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    order_time = datetime(2026, 1, 1, 1, 5, tzinfo=UTC)
+    trade.orders[-1].order_date = order_time
+    dataframe = DataFrame(
+        [
+            {
+                "date": datetime(2026, 1, 1, 1, 4, tzinfo=UTC),
+                "close": 97.5,
+                "atr": 1.0,
+                "signal": "",
+            }
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[-1],
+        current_time=order_time,
+    )
+
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(decision_time)
+
+
+def test_safety_order_consumes_signal_when_atr_distance_is_not_reached(monkeypatch) -> None:
+    strategy = _strategy()
+    strategy.so_atr_mult.value = 2.0
+    trade = _trade(False)
+    _add_filled_entries(trade, (100.0,))
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    candle = Series(
+        {
+            "date": signal_time,
+            "close": 98.1,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+
+    assert (
+        strategy._safety_order_adjustment(
+            trade,
+            candle,
+            signal_time,
+            min_stake=None,
+            max_stake=1000.0,
+        )
+        is None
+    )
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
+def test_adjust_trade_position_recovers_previous_candle_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    strategy.enable_shorts.value = True
+    strategy.so_atr_mult.value = 2.0
+    trade = _trade(True)
+    _add_filled_entries(trade, (100.0,))
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    dataframe = DataFrame(
+        [
+            {
+                "date": signal_time,
+                "close": 102.1,
+                "atr": 1.0,
+                "signal": "↓",
+                "tp_signal": 0,
+            },
+            {
+                "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+                "close": 102.2,
+                "atr": 1.0,
+                "signal": "",
+                "tp_signal": 0,
+            },
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+        current_rate=102.3,
+        current_profit=-0.1,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=102.3,
+        current_exit_rate=102.2,
+        current_entry_profit=-0.1,
+        current_exit_profit=-0.1,
+    )
+
+    assert adjustment is not None
+    assert adjustment[1] == "📉-🛡️⓵"
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
+def test_recovered_safety_order_signal_requires_current_entry_rate(monkeypatch) -> None:
+    strategy = _strategy()
+    strategy.enable_shorts.value = True
+    strategy.so_atr_mult.value = 2.0
+    trade = _trade(True)
+    _add_filled_entries(trade, (100.0,))
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    dataframe = DataFrame(
+        [
+            {
+                "date": signal_time,
+                "close": 102.1,
+                "atr": 1.0,
+                "signal": "↓",
+                "tp_signal": 0,
+            },
+            {
+                "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+                "close": 101.9,
+                "atr": 1.0,
+                "signal": "",
+                "tp_signal": 0,
+            },
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+        current_rate=101.9,
+        current_profit=-0.1,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=101.9,
+        current_exit_rate=101.8,
+        current_entry_profit=-0.1,
+        current_exit_profit=-0.1,
+    )
+
+    assert adjustment is None
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
 def test_take_profit_logs_each_candle_result_once(caplog) -> None:
     strategy = _strategy()
     trade = _trade(False)
@@ -826,11 +966,22 @@ def test_take_profit_logs_each_candle_result_once(caplog) -> None:
 
     messages = [record.getMessage() for record in caplog.records]
     assert len(messages) == 2
-    assert messages[0].startswith("TP skipped | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 |")
-    assert messages[1].startswith("TP reached | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 |")
+    break_even_rate = trade.calc_close_rate_for_roi(0.0)
+    skipped_rate = tp_target_rate - 0.00001
+    assert messages == [
+        "TP skipped | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 | "
+        f"exit {strategy._format_log_number(skipped_rate)} < "
+        f"target {strategy._format_log_number(tp_target_rate)} | remaining 0.00001 | "
+        f"target = BE {strategy._format_log_number(break_even_rate)} + "
+        "3 x ATR 0.00003625",
+        "TP reached | #145 DOGE/USDT:USDT long | 2026-07-24 06:19 | "
+        f"exit {strategy._format_log_number(tp_target_rate)} >= "
+        f"target {strategy._format_log_number(tp_target_rate)} | beyond 0 | "
+        f"target = BE {strategy._format_log_number(break_even_rate)} + "
+        "3 x ATR 0.00003625",
+    ]
     assert all("Trade(" not in message for message in messages)
     assert all("+00:00" not in message for message in messages)
-    assert all("ATR distance 0.00003625 x3 = 0.00010875" in message for message in messages)
 
 
 def test_safety_order_tags_use_circled_numerals() -> None:
@@ -854,10 +1005,10 @@ def test_safety_order_tags_use_circled_numerals() -> None:
 
 
 @pytest.mark.parametrize(
-    ("is_short", "signal", "candle_close", "comparison"),
+    ("is_short", "signal", "candle_close", "comparison", "operator"),
     [
-        (False, "↑", 0.06934, "<="),
-        (True, "↓", 0.06890, ">="),
+        (False, "↑", 0.06934, ">", "-"),
+        (True, "↓", 0.06890, "<", "+"),
     ],
 )
 def test_safety_order_atr_skip_is_logged_once(
@@ -866,8 +1017,10 @@ def test_safety_order_atr_skip_is_logged_once(
     signal: str,
     candle_close: float,
     comparison: str,
+    operator: str,
 ) -> None:
     strategy = _strategy()
+    strategy.enable_shorts.value = True
     strategy.so_atr_mult.value = 3.0
     trade = _trade(is_short)
     trade.id = 501 if is_short else 500
@@ -945,10 +1098,11 @@ def test_safety_order_atr_skip_is_logged_once(
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         f"SO skipped | #{trade.id} DOGE/USDT:USDT {side} | 2026-07-24 21:22 | "
-        f"close {strategy._format_log_number(candle_close)} | "
-        f"required {comparison} {strategy._format_log_number(so_trigger_rate)} | "
-        f"last entry {strategy._format_log_number(entry_price)} | "
-        "ATR distance 0.00003625 x3 = 0.00010875"
+        f"close {strategy._format_log_number(candle_close)} {comparison} "
+        f"trigger {strategy._format_log_number(so_trigger_rate)} | "
+        f"remaining {strategy._format_log_number(abs(candle_close - so_trigger_rate))} | "
+        f"trigger = last entry {strategy._format_log_number(entry_price)} "
+        f"{operator} 3 x ATR 0.00003625"
     ]
 
 
@@ -968,7 +1122,7 @@ def _set_leverage_tiers(strategy: RSIMLDCAStrategy, pair: str, tiers: list[dict]
     strategy.dp = SimpleNamespace(_exchange=SimpleNamespace(_leverage_tiers={pair: tiers}))
 
 
-def test_leverage_uses_configured_exchange_tier(caplog) -> None:
+def test_leverage_uses_complete_dca_and_hedge_budget(caplog) -> None:
     strategy = _strategy()
     pair = "LTC/USDT:USDT"
     _set_leverage_tiers(strategy, pair, _ltc_leverage_tiers())
@@ -985,32 +1139,45 @@ def test_leverage_uses_configured_exchange_tier(caplog) -> None:
             max_leverage=50.0,
             entry_tag="📈",
             side="long",
+            proposed_stake=500.0,
         )
 
-    assert strategy.leverage_tier.value == 3
-    assert leverage == 20.0
+    assert strategy.leverage_buffer_pct.value == 5.0
+    assert leverage == 16.0
     assert [record.getMessage() for record in caplog.records] == [
-        "Leverage selected | LTC/USDT:USDT long | 2026-07-24 21:22 | tier 3/7 | 20x"
+        (
+            "Leverage selected | LTC/USDT:USDT long | 2026-07-24 21:22 | 16x | "
+            "DCA 500 USDT + hedge 500 USDT | gross notional 16000 USDT | "
+            "tier 5/7, usable 17100 USDT (5% buffer) | utilization 93.57%"
+        )
     ]
 
 
-def test_leverage_uses_last_available_tier() -> None:
+def test_leverage_falls_back_to_one_when_no_tier_can_fit(caplog) -> None:
     strategy = _strategy()
-    strategy.leverage_tier.value = 50
     pair = "LTC/USDT:USDT"
     _set_leverage_tiers(strategy, pair, _ltc_leverage_tiers())
 
-    leverage = strategy.leverage(
-        pair=pair,
-        current_time=datetime(2026, 7, 24, 21, 22, tzinfo=UTC),
-        current_rate=120.0,
-        proposed_leverage=1.0,
-        max_leverage=50.0,
-        entry_tag="📈",
-        side="long",
-    )
+    with caplog.at_level(
+        logging.WARNING,
+        logger="user_data.strategies.rsi_ml_dca_strategy",
+    ):
+        leverage = strategy.leverage(
+            pair=pair,
+            current_time=datetime(2026, 7, 24, 21, 22, tzinfo=UTC),
+            current_rate=120.0,
+            proposed_leverage=1.0,
+            max_leverage=50.0,
+            entry_tag="📈",
+            side="long",
+            proposed_stake=16000.0,
+        )
 
-    assert leverage == 14.28
+    assert leverage == 1.0
+    assert [record.getMessage() for record in caplog.records] == [
+        "Leverage fallback | LTC/USDT:USDT long | 2026-07-24 21:22 | 1x | "
+        "DCA 16000 USDT + hedge 16000 USDT | no tier fits 5% buffer"
+    ]
 
 
 def test_leverage_respects_callback_exchange_cap() -> None:
@@ -1026,9 +1193,10 @@ def test_leverage_respects_callback_exchange_cap() -> None:
         max_leverage=18.18,
         entry_tag="📈",
         side="long",
+        proposed_stake=500.0,
     )
 
-    assert leverage == 18.18
+    assert leverage == 16.0
 
 
 @pytest.mark.parametrize(

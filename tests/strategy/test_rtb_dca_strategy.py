@@ -9,14 +9,14 @@ from pandas import DataFrame, date_range
 
 from freqtrade.exchange import ROUND_DOWN, ROUND_UP
 from freqtrade.persistence import Order, Trade
-from user_data.strategies.rtpb_dca_strategy import (
-    RTPBDCAStrategy,
-    calc_rtpb_traps_nb,
+from user_data.strategies.rtb_dca_strategy import (
+    RTBDCAStrategy,
+    calc_rtb_traps_nb,
 )
 
 
-def _strategy() -> RTPBDCAStrategy:
-    strategy = RTPBDCAStrategy({"stake_currency": "USDT"})
+def _strategy() -> RTBDCAStrategy:
+    strategy = RTBDCAStrategy({"stake_currency": "USDT"})
     strategy.vol_scale.value = 1.5
     strategy.max_safe_orders.value = 5
     strategy.so_atr_mult.value = 2.0
@@ -106,7 +106,7 @@ def _filled_order(trade: Trade, price: float, index: int) -> Order:
     order.ft_order_tag = (
         f"{side_prefix}-📍"
         if index == 0
-        else f"{side_prefix}-🛡️{RTPBDCAStrategy.SAFETY_ORDER_NUMERALS[index - 1]}"
+        else f"{side_prefix}-🛡️{RTBDCAStrategy.SAFETY_ORDER_NUMERALS[index - 1]}"
     )
     return order
 
@@ -123,7 +123,7 @@ def _trade(is_short: bool, entry_prices: tuple[float, ...] = (100.0,)) -> Trade:
         open_date=datetime(2026, 1, 1, tzinfo=UTC),
         open_rate=sum(entry_prices) / len(entry_prices),
         exchange="binance",
-        strategy="RTPBDCAStrategy",
+        strategy="RTBDCAStrategy",
         timeframe=1,
         leverage=1.0,
         is_short=is_short,
@@ -150,7 +150,7 @@ def _add_open_exit(trade: Trade, price: float = 105.0) -> None:
         trade.pair,
         trade.exit_side,
     )
-    order.ft_order_tag = RTPBDCAStrategy.TAKE_PROFIT_EXIT_TAG
+    order.ft_order_tag = RTBDCAStrategy.TAKE_PROFIT_EXIT_TAG
     trade.orders.append(order)
 
 
@@ -165,7 +165,7 @@ def _custom_data(monkeypatch, trade: Trade, initial: dict | None = None) -> dict
     return data
 
 
-def _attach_exchange(strategy: RTPBDCAStrategy, dataframe: DataFrame) -> None:
+def _attach_exchange(strategy: RTBDCAStrategy, dataframe: DataFrame) -> None:
     def round_price(pair: str, price: float, *, rounding_mode: int) -> float:
         ticks = price / 0.01
         if rounding_mode == ROUND_UP:
@@ -189,7 +189,7 @@ def test_trap_kernel_matches_state_machine_reference() -> None:
     low = close - 1.2
 
     expected = _trap_reference(high, low, close, upper, lower, 4, 6, True, True)
-    actual = calc_rtpb_traps_nb(high, low, close, upper, lower, 4, 6, True, True)
+    actual = calc_rtb_traps_nb(high, low, close, upper, lower, 4, 6, True, True)
 
     assert actual[0].dtype == np.int8
     assert actual[1].dtype == np.int8
@@ -205,7 +205,7 @@ def test_disabled_traps_do_not_consume_shared_signal_gap() -> None:
     high = np.array([101.0, 107.0, 106.0, 95.0, 97.0])
     low = np.array([99.0, 105.0, 103.0, 93.0, 94.0])
 
-    bull, bear = calc_rtpb_traps_nb(
+    bull, bear = calc_rtb_traps_nb(
         high,
         low,
         close,
@@ -270,8 +270,9 @@ def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch)
     dataframe["atr"] = [1.5, 2.5, 3.5, 4.5]
     _attach_exchange(strategy, dataframe)
     trade.orders[0].order_date = dataframe["date"].iat[2].to_pydatetime()
+    trade.orders[0].order_filled_date = dataframe["date"].iat[2].to_pydatetime()
 
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtpb_dca_strategy"):
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
         strategy.order_filled(
             pair=trade.pair,
             trade=trade,
@@ -281,6 +282,7 @@ def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch)
 
         safety_order = _filled_order(trade, 95.0, 1)
         safety_order.order_date = dataframe["date"].iat[2].to_pydatetime()
+        safety_order.order_filled_date = dataframe["date"].iat[2].to_pydatetime()
         trade.orders.append(safety_order)
         strategy.order_filled(
             pair=trade.pair,
@@ -289,12 +291,13 @@ def test_order_fill_uses_submission_basis_and_fill_time_atr(caplog, monkeypatch)
             current_time=dataframe["date"].iat[-1].to_pydatetime(),
         )
 
-    assert data["rtpb_tp_basis"] == pytest.approx(101.5)
-    assert data["rtpb_tp_atr"] == pytest.approx(4.5)
-    assert data["rtpb_last_dca_signal_time"] == str(dataframe["date"].iat[1])
+    assert data["rtb_tp_basis"] == pytest.approx(101.5)
+    assert data["rtb_tp_atr"] == pytest.approx(3.5)
+    assert data["rtb_last_dca_signal_time"] == str(dataframe["date"].iat[1])
     messages = [record.getMessage() for record in caplog.records]
-    assert messages[0].startswith("Initial order filled | #81 ETH/USDT:USDT long")
+    assert messages[0].startswith("BO filled | #81 ETH/USDT:USDT long")
     assert messages[1].startswith("SO filled | #81 ETH/USDT:USDT long")
+    assert "🛡️" not in messages[1]
 
 
 def test_order_fill_does_not_use_a_post_order_candle(monkeypatch) -> None:
@@ -320,6 +323,153 @@ def test_order_fill_does_not_use_a_post_order_candle(monkeypatch) -> None:
     assert strategy.LAST_DCA_SIGNAL_KEY not in data
 
 
+def test_safety_order_fill_preserves_decision_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False, (100.0, 98.0))
+    decision_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    data = _custom_data(
+        monkeypatch,
+        trade,
+        {strategy.LAST_DCA_SIGNAL_KEY: str(decision_time)},
+    )
+    order_time = datetime(2026, 1, 1, 1, 5, tzinfo=UTC)
+    trade.orders[-1].order_date = order_time
+    dataframe = _ohlcv(np.array([97.5]))
+    dataframe["date"] = [datetime(2026, 1, 1, 1, 4, tzinfo=UTC)]
+    dataframe["basis"] = 98.0
+    dataframe["atr"] = 1.0
+    _attach_exchange(strategy, dataframe)
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[-1],
+        current_time=order_time,
+    )
+
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == str(decision_time)
+
+
+def test_safety_order_consumes_signal_when_atr_distance_is_not_reached(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    data = _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([98.1]))
+    dataframe["atr"] = 1.0
+    dataframe["signal"] = "↑"
+    candle = dataframe.iloc[-1].squeeze()
+
+    assert (
+        strategy._safety_order_adjustment(
+            trade=trade,
+            last_candle=candle,
+            current_time=candle["date"].to_pydatetime(),
+            min_stake=None,
+            max_stake=1000.0,
+        )
+        is None
+    )
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == str(candle["date"])
+
+
+def test_adjust_trade_position_recovers_previous_candle_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    data = _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([97.9, 97.8]))
+    dataframe["atr"] = 1.0
+    dataframe["signal"] = ["↑", ""]
+    _attach_exchange(strategy, dataframe)
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=dataframe["date"].iat[-1].to_pydatetime(),
+        current_rate=97.8,
+        current_profit=-0.03,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=97.8,
+        current_exit_rate=97.8,
+        current_entry_profit=-0.03,
+        current_exit_profit=-0.03,
+    )
+
+    assert adjustment is not None
+    assert adjustment[1] == "📈-🛡️⓵"
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == str(dataframe["date"].iat[0])
+
+
+def test_adjust_trade_position_never_falls_back_to_an_older_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    data = _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([90.0, 97.0]))
+    dataframe["atr"] = 1.0
+    dataframe["signal"] = ["↑", "↑"]
+    _attach_exchange(strategy, dataframe)
+
+    first_adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=dataframe["date"].iat[-1].to_pydatetime(),
+        current_rate=97.0,
+        current_profit=-0.03,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=97.0,
+        current_exit_rate=97.0,
+        current_entry_profit=-0.03,
+        current_exit_profit=-0.03,
+    )
+
+    assert first_adjustment is not None
+    assert first_adjustment[1] == "📈-🛡️⓵"
+    newest_signal_time = str(dataframe["date"].iat[-1])
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == newest_signal_time
+
+    trade.orders.append(_filled_order(trade, 97.0, 1))
+    second_adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=dataframe["date"].iat[-1].to_pydatetime(),
+        current_rate=90.0,
+        current_profit=-0.1,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=90.0,
+        current_exit_rate=90.0,
+        current_entry_profit=-0.1,
+        current_exit_profit=-0.1,
+    )
+
+    assert second_adjustment is None
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == newest_signal_time
+
+
+def test_recovered_safety_order_signal_requires_current_entry_rate(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    data = _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([97.9, 98.1]))
+    dataframe["atr"] = 1.0
+    dataframe["signal"] = ["↑", ""]
+    _attach_exchange(strategy, dataframe)
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=dataframe["date"].iat[-1].to_pydatetime(),
+        current_rate=98.1,
+        current_profit=-0.02,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=98.1,
+        current_exit_rate=98.1,
+        current_entry_profit=-0.02,
+        current_exit_profit=-0.02,
+    )
+
+    assert adjustment is None
+    assert data[strategy.LAST_DCA_SIGNAL_KEY] == str(dataframe["date"].iat[0])
+
+
 @pytest.mark.parametrize("is_short", [False, True])
 def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_rounding(
     caplog,
@@ -331,7 +481,7 @@ def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_roundi
     _custom_data(
         monkeypatch,
         trade,
-        {"rtpb_tp_basis": 100.0, "rtpb_tp_atr": 2.0},
+        {"rtb_tp_basis": 100.0, "rtb_tp_atr": 2.0},
     )
     dataframe = _ohlcv(np.array([100.0]))
     dataframe["signal"] = ""
@@ -349,7 +499,7 @@ def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_roundi
         else math.ceil(raw_tp_rate * 100.0) / 100.0
     )
 
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtpb_dca_strategy"):
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
         result = strategy.custom_exit_price(
             pair=trade.pair,
             trade=trade,
@@ -360,8 +510,19 @@ def test_custom_exit_price_uses_exact_fee_adjustment_and_directional_tick_roundi
         )
 
     assert result == pytest.approx(expected_tp_rate)
-    assert next(record.getMessage() for record in caplog.records).startswith(
-        "TP limit | #81 ETH/USDT:USDT"
+    message = next(record.getMessage() for record in caplog.records)
+    minimum_tp_rate = strategy._minimum_tp_rate(trade)
+    selector = "min" if is_short else "max"
+    target_operator = "-" if is_short else "+"
+    fee_operator = "+" if is_short else "-"
+    side = "short" if is_short else "long"
+    assert message == (
+        f"TP limit | #81 ETH/USDT:USDT {side} | 2026-01-01 01:00 | "
+        f"limit {strategy._format_log_number(expected_tp_rate)} | "
+        f"target = {selector}(basis 100, minimum "
+        f"{strategy._format_log_number(minimum_tp_rate)}) | "
+        f"minimum = BE {strategy._format_log_number(break_even)} {target_operator} "
+        f"1 x ATR 2 / (1 {fee_operator} fee 0.001)"
     )
 
 
@@ -371,7 +532,7 @@ def test_profitable_opposite_trap_does_not_replace_take_profit(monkeypatch) -> N
     _custom_data(
         monkeypatch,
         trade,
-        {"rtpb_tp_basis": 101.0, "rtpb_tp_atr": 1.0},
+        {"rtb_tp_basis": 101.0, "rtb_tp_atr": 1.0},
     )
     dataframe = _ohlcv(np.array([100.0]))
     dataframe["signal"] = "↓"
@@ -408,7 +569,7 @@ def test_resting_tp_does_not_block_qualifying_safety_order(caplog, monkeypatch) 
     data = _custom_data(
         monkeypatch,
         trade,
-        {"rtpb_tp_basis": 101.0, "rtpb_tp_atr": 1.0},
+        {"rtb_tp_basis": 101.0, "rtb_tp_atr": 1.0},
     )
     _add_open_exit(trade)
     dataframe = _ohlcv(np.array([97.9]))
@@ -416,7 +577,7 @@ def test_resting_tp_does_not_block_qualifying_safety_order(caplog, monkeypatch) 
     dataframe["signal"] = "↑"
     _attach_exchange(strategy, dataframe)
 
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtpb_dca_strategy"):
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
         adjustment = strategy.adjust_trade_position(
             trade=trade,
             current_time=dataframe["date"].iat[-1].to_pydatetime(),
@@ -433,10 +594,40 @@ def test_resting_tp_does_not_block_qualifying_safety_order(caplog, monkeypatch) 
     assert adjustment is not None
     assert adjustment[0] == pytest.approx(trade.orders[0].stake_amount_filled * 1.5)
     assert adjustment[1] == "📈-🛡️⓵"
-    assert data["rtpb_last_dca_signal_time"] == str(dataframe["date"].iat[-1])
-    assert next(record.getMessage() for record in caplog.records).startswith(
-        "SO requested | #81 ETH/USDT:USDT long"
-    )
+    assert data["rtb_last_dca_signal_time"] == str(dataframe["date"].iat[-1])
+    message = next(record.getMessage() for record in caplog.records)
+    assert message.startswith("SO requested | #81 ETH/USDT:USDT long")
+    assert "🛡️" not in message
+
+
+def test_safety_order_skip_log_uses_trigger_comparison_and_remaining_distance(
+    caplog,
+    monkeypatch,
+) -> None:
+    strategy = _strategy()
+    strategy.enable_longs.value = True
+    trade = _trade(False)
+    _custom_data(monkeypatch, trade)
+    dataframe = _ohlcv(np.array([98.1]))
+    dataframe["atr"] = 1.0
+    dataframe["signal"] = "↑"
+    candle = dataframe.iloc[-1].squeeze()
+
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
+        adjustment = strategy._safety_order_adjustment(
+            trade=trade,
+            last_candle=candle,
+            current_time=candle["date"].to_pydatetime(),
+            min_stake=None,
+            max_stake=1000.0,
+        )
+
+    assert adjustment is None
+    assert [record.getMessage() for record in caplog.records] == [
+        "SO skipped | #81 ETH/USDT:USDT long | 2026-01-01 00:00 | "
+        "close 98.1 > trigger 98 | remaining 0.1 | "
+        "trigger = last entry 100 - 2 x ATR 1"
+    ]
 
 
 def test_pending_non_tp_exit_blocks_safety_order(monkeypatch) -> None:
@@ -445,7 +636,7 @@ def test_pending_non_tp_exit_blocks_safety_order(monkeypatch) -> None:
     _custom_data(
         monkeypatch,
         trade,
-        {"rtpb_tp_basis": 101.0, "rtpb_tp_atr": 1.0},
+        {"rtb_tp_basis": 101.0, "rtb_tp_atr": 1.0},
     )
     _add_open_exit(trade)
     trade.orders[-1].ft_order_tag = "manual-exit"
@@ -481,13 +672,13 @@ def test_emergency_break_even_replaces_normal_target_after_final_safety_order(
     _custom_data(
         monkeypatch,
         trade,
-        {"rtpb_tp_basis": 110.0, "rtpb_tp_atr": 3.0},
+        {"rtb_tp_basis": 110.0, "rtb_tp_atr": 3.0},
     )
     dataframe = _ohlcv(np.array([97.0]))
     dataframe["signal"] = ""
     _attach_exchange(strategy, dataframe)
 
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtpb_dca_strategy"):
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy"):
         result = strategy.custom_exit_price(
             pair=trade.pair,
             trade=trade,
@@ -499,14 +690,17 @@ def test_emergency_break_even_replaces_normal_target_after_final_safety_order(
 
     expected = math.ceil(trade.calc_close_rate_for_roi(0.0) * 100.0) / 100.0
     assert result == pytest.approx(expected)
-    assert next(record.getMessage() for record in caplog.records).startswith(
-        "Emergency BE limit | #81 ETH/USDT:USDT"
+    message = next(record.getMessage() for record in caplog.records)
+    assert message == (
+        "Emergency BE limit | #81 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        f"limit {strategy._format_log_number(expected)} | "
+        f"target = BE {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
     )
 
 
-def test_leverage_logs_all_loaded_tiers_as_a_table_once(caplog) -> None:
+def test_leverage_logs_selected_buffered_tier(caplog) -> None:
     strategy = _strategy()
-    strategy.leverage_tier.value = 2
+    strategy.leverage_buffer_pct.value = 5.0
     pair = "LTC/USDT:USDT"
     strategy.dp = SimpleNamespace(
         _exchange=SimpleNamespace(
@@ -528,7 +722,7 @@ def test_leverage_logs_all_loaded_tiers_as_a_table_once(caplog) -> None:
             }
         )
     )
-    caplog.set_level(logging.INFO, logger="user_data.strategies.rtpb_dca_strategy")
+    caplog.set_level(logging.INFO, logger="user_data.strategies.rtb_dca_strategy")
     callback_args = {
         "pair": pair,
         "current_time": datetime(2026, 1, 1, tzinfo=UTC),
@@ -539,23 +733,13 @@ def test_leverage_logs_all_loaded_tiers_as_a_table_once(caplog) -> None:
         "side": "long",
     }
 
-    assert strategy.leverage(**callback_args) == pytest.approx(40.0)
-    assert strategy.leverage(**callback_args) == pytest.approx(40.0)
+    callback_args["proposed_stake"] = 100.0
 
-    table_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.getMessage().startswith("Leverage tiers loaded |")
+    assert strategy.leverage(**callback_args) == pytest.approx(9.0)
+    assert [record.getMessage() for record in caplog.records] == [
+        (
+            "Leverage selected | LTC/USDT:USDT long | 2026-01-01 00:00 | 9x | "
+            "DCA 100 USDT + hedge 100 USDT | gross notional 1800 USDT | "
+            "tier 2/2, usable 1900 USDT (5% buffer) | utilization 94.74%"
+        )
     ]
-    assert len(table_messages) == 1
-    table = table_messages[0]
-    assert "Leverage tiers loaded | LTC/USDT:USDT" in table
-    assert "Use | Tier | Notional range (USDT) | MMR   | Initial margin | Max leverage" in table
-    assert "| 1    | 0 to 500" in table
-    assert "0.65%" in table
-    assert "2%" in table
-    assert "50x" in table
-    assert "*   | 2    | 500.1 to 2000" in table
-    assert "1%" in table
-    assert "2.5%" in table
-    assert "40x" in table

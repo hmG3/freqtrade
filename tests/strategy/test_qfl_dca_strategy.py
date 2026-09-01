@@ -436,16 +436,16 @@ def test_entry_and_safety_order_tags_follow_shared_pattern() -> None:
     assert strategy.EMERGENCY_BREAK_EVEN_EXIT_TAG == "🛟"
 
 
-def test_leverage_uses_configured_exchange_tier() -> None:
+def test_leverage_respects_exchange_cap_and_buffered_tier() -> None:
     strategy = _strategy()
-    strategy.leverage_tier.value = 2
+    strategy.leverage_buffer_pct.value = 5.0
     pair = "ETH/USDT:USDT"
     strategy.dp = SimpleNamespace(
         _exchange=SimpleNamespace(
             _leverage_tiers={
                 pair: [
-                    {"minNotional": 0.0, "maxLeverage": 50.0},
-                    {"minNotional": 500.0, "maxLeverage": 25.0},
+                    {"minNotional": 0.0, "maxNotional": 5000.0, "maxLeverage": 50.0},
+                    {"minNotional": 5000.0, "maxNotional": 10000.0, "maxLeverage": 25.0},
                 ]
             }
         )
@@ -459,6 +459,7 @@ def test_leverage_uses_configured_exchange_tier() -> None:
         max_leverage=20.0,
         entry_tag="📈-📍",
         side="long",
+        proposed_stake=100.0,
     )
 
     assert leverage == pytest.approx(20.0)

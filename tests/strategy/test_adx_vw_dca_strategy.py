@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +34,7 @@ def test_okx_config_supports_break_even_limit_exit() -> None:
 
 def _strategy() -> ADXVWDCAStrategy:
     strategy = ADXVWDCAStrategy({"stake_currency": "USDT"})
-    strategy.leverage_tier.value = 3
+    strategy.leverage_buffer_pct.value = 5.0
     strategy.max_safe_orders.value = 5
     strategy.vol_scale.value = 1.5
     strategy.so_atr_mult.value = 2.0
@@ -239,6 +239,21 @@ def test_adx_vw_kernel_handles_empty_input() -> None:
     assert all(boundary.dtype == np.float64 and len(boundary) == 0 for boundary in boundaries)
 
 
+def test_startup_candles_cover_adx_warmup_before_envelope_smoothing() -> None:
+    strategy = _strategy()
+    strategy.entry_bb_length.value = 20
+    strategy.entry_adx_length.value = 14
+    strategy.entry_adx_smooth.value = 14
+    strategy.entry_smooth_length.value = 50
+    strategy.exit_bb_length.value = 20
+    strategy.exit_adx_length.value = 14
+    strategy.exit_adx_smooth.value = 14
+    strategy.exit_smooth_length.value = 50
+    strategy.atr_length.value = 14
+
+    assert strategy.startup_candle_count == 81
+
+
 def test_entry_engine_has_no_separate_timeframe_setting() -> None:
     strategy = _strategy()
 
@@ -251,7 +266,7 @@ def test_lower_management_timeframes_are_rejected() -> None:
     strategy.exit_adx_timeframe = "1m"
 
     with pytest.raises(ValueError, match="exit_adx_timeframe"):
-        strategy._adx_timeframes()
+        strategy._exit_adx_timeframe()
 
 
 def test_higher_timeframe_signal_is_confirmed_deduplicated_and_temp_columns_drop(
@@ -275,17 +290,15 @@ def test_higher_timeframe_signal_is_confirmed_deduplicated_and_temp_columns_drop
 
     monkeypatch.setattr(adx_module, "calc_adx_vw_signals_nb", fake_signals)
 
-    result, _, exit_engine, sl_engine = strategy._ADXVWDCAStrategy__prepare_signal_engines(
+    result, _, exit_engine = strategy._ADXVWDCAStrategy__prepare_signal_engines(
         dataframe=dataframe,
         metadata={"pair": "ETH/USDT:USDT"},
         exit_timeframe="5m",
-        sl_timeframe="5m",
         entry_settings=ENGINE_SETTINGS,
         exit_settings=ENGINE_SETTINGS,
     )
 
     assert np.flatnonzero(exit_engine[0]).tolist() == [9]
-    assert np.flatnonzero(sl_engine[0]).tolist() == [9]
     assert calculation_lengths == [len(dataframe), len(informative)]
     assert not any(column.startswith("_") for column in result.columns)
     assert not any(column.startswith("date_") for column in result.columns)
@@ -306,22 +319,15 @@ def test_indicator_signal_columns_and_reverse_candidate_window() -> None:
         np.array([0, 0, 0, 0, 1, 0, 0], dtype=np.int8),
         np.array([0, 1, 0, 0, 0, 0, 0], dtype=np.int8),
     )
-    sl_engine = (
-        np.array([0, 0, 1, 0, 0, 0, 0], dtype=np.int8),
-        np.array([0, 0, 0, 0, 0, 1, 0], dtype=np.int8),
-    )
-
     result = strategy._ADXVWDCAStrategy__populate_adx_vw_dca(
         dataframe,
         entry_engine,
         exit_engine,
-        sl_engine,
         atr_length=2,
     )
 
     assert result["signal"].tolist() == ["", "↑", "", "↓", "", "", ""]
     assert result["tp_signal"].tolist() == [0, 1, 0, 0, -1, 0, 0]
-    assert result["sl_signal"].tolist() == [0, 0, 1, 0, 0, -1, 0]
     assert result["reverse_signal"].tolist() == [0, -1, -1, 0, 1, 1, 0]
     assert result["upper_zone_inner"].tolist() == list(np.arange(101.0, 108.0))
     assert result["upper_zone_outer"].tolist() == list(np.arange(111.0, 118.0))
@@ -341,14 +347,12 @@ def test_populate_indicators_keeps_only_callback_and_plot_columns() -> None:
         "atr",
         "signal",
         "tp_signal",
-        "sl_signal",
         "reverse_signal",
         "upper_zone_inner",
         "upper_zone_outer",
         "lower_zone_inner",
         "lower_zone_outer",
     }
-    assert "signal_stop_signal" not in result.columns
     assert not any(column.startswith("_") for column in result.columns)
 
 
@@ -392,25 +396,30 @@ def test_long_and_short_tags_use_shared_prefix_suffix_combinations() -> None:
     assert result["enter_tag"].tolist() == ["📈-📍", "📉-📍", "📈-🔄", "📉-🔄"]
 
 
-def test_custom_stake_reserves_complete_geometric_dca_budget() -> None:
+def test_custom_stake_logs_geometric_dca_parts(caplog) -> None:
     strategy = _strategy()
     strategy.vol_scale.value = 1.5
     strategy.max_safe_orders.value = 5
 
-    stake = strategy.custom_stake_amount(
-        pair="ETH/USDT:USDT",
-        current_time=datetime(2026, 1, 1, tzinfo=UTC),
-        current_rate=100.0,
-        proposed_stake=207.8125,
-        min_stake=None,
-        max_stake=207.8125,
-        leverage=20.0,
-        entry_tag=strategy.LONG_ENTRY_TAG,
-        side="long",
-    )
+    with caplog.at_level(logging.INFO, logger="user_data.strategies.adx_vw_dca_strategy"):
+        stake = strategy.custom_stake_amount(
+            pair="ETH/USDT:USDT",
+            current_time=datetime(2026, 1, 1, tzinfo=UTC),
+            current_rate=100.0,
+            proposed_stake=207.8125,
+            min_stake=None,
+            max_stake=207.8125,
+            leverage=20.0,
+            entry_tag=strategy.LONG_ENTRY_TAG,
+            side="long",
+        )
 
-    assert strategy._max_dca_multiplier() == pytest.approx(20.78125)
     assert stake == pytest.approx(10.0)
+    assert [record.getMessage() for record in caplog.records] == [
+        "Initial stake requested | ETH/USDT:USDT long | 2026-01-01 00:00 | "
+        "10 USDT | DCA budget 207.812 USDT ÷ DCA factor 20.78125 "
+        "(∑ 1 + 1.5 + 2.25 + 3.375 + 5.0625 + 7.59375)"
+    ]
 
 
 def test_initial_fill_consumes_entry_signal_before_safety_order(monkeypatch) -> None:
@@ -505,6 +514,45 @@ def test_initial_fill_does_not_consume_a_post_order_signal(monkeypatch) -> None:
     assert strategy.LAST_DCA_SIGNAL_KEY not in custom_data
 
 
+def test_safety_order_fill_preserves_decision_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False, (100.0, 98.0))
+    decision_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    custom_data = {strategy.LAST_DCA_SIGNAL_KEY: str(decision_time)}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    order_time = datetime(2026, 1, 1, 1, 5, tzinfo=UTC)
+    trade.orders[-1].order_date = order_time
+    dataframe = DataFrame(
+        [
+            {
+                "date": datetime(2026, 1, 1, 1, 4, tzinfo=UTC),
+                "close": 97.5,
+                "atr": 1.0,
+                "signal": "",
+            }
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    strategy.order_filled(
+        pair=trade.pair,
+        trade=trade,
+        order=trade.orders[-1],
+        current_time=order_time,
+    )
+
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(decision_time)
+
+
 def test_safety_order_skip_log_survives_trade_reload(monkeypatch, caplog) -> None:
     strategy = _strategy()
     trade = _trade(False)
@@ -544,8 +592,11 @@ def test_safety_order_skip_log_survives_trade_reload(monkeypatch, caplog) -> Non
             )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert len(messages) == 1
-    assert messages[0].startswith("SO skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 |")
+    assert messages == [
+        "SO skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        "close 98.1 > trigger 98 | remaining 0.1 | "
+        "trigger = last entry 100 - 2 x ATR 1"
+    ]
 
 
 def test_safety_order_requires_fresh_signal_and_atr_distance(monkeypatch) -> None:
@@ -599,6 +650,148 @@ def test_safety_order_requires_fresh_signal_and_atr_distance(monkeypatch) -> Non
     )
 
 
+def test_safety_order_consumes_a_signal_when_atr_distance_is_not_reached(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(False)
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    candle = Series(
+        {
+            "date": signal_time,
+            "close": 98.1,
+            "atr": 1.0,
+            "signal": "↑",
+        }
+    )
+
+    assert (
+        strategy._safety_order_adjustment(
+            trade,
+            candle,
+            signal_time,
+            min_stake=None,
+            max_stake=1000.0,
+        )
+        is None
+    )
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
+def test_adjust_trade_position_recovers_previous_candle_signal(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(True)
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    dataframe = DataFrame(
+        [
+            {
+                "date": signal_time,
+                "close": 102.1,
+                "atr": 1.0,
+                "signal": "↓",
+                "tp_signal": 0,
+            },
+            {
+                "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+                "close": 102.2,
+                "atr": 1.0,
+                "signal": "",
+                "tp_signal": 0,
+            },
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+        current_rate=102.3,
+        current_profit=-0.1,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=102.3,
+        current_exit_rate=102.2,
+        current_entry_profit=-0.1,
+        current_exit_profit=-0.1,
+    )
+
+    assert adjustment is not None
+    assert adjustment[1] == "📉-🛡️⓵"
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
+def test_recovered_safety_order_signal_requires_current_entry_rate(monkeypatch) -> None:
+    strategy = _strategy()
+    trade = _trade(True)
+    custom_data: dict[str, str] = {}
+    monkeypatch.setattr(
+        trade,
+        "get_custom_data",
+        lambda key, default=None: custom_data.get(key, default),
+    )
+    monkeypatch.setattr(
+        trade,
+        "set_custom_data",
+        lambda key, value: custom_data.__setitem__(key, value),
+    )
+    signal_time = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+    dataframe = DataFrame(
+        [
+            {
+                "date": signal_time,
+                "close": 102.1,
+                "atr": 1.0,
+                "signal": "↓",
+                "tp_signal": 0,
+            },
+            {
+                "date": datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+                "close": 101.9,
+                "atr": 1.0,
+                "signal": "",
+                "tp_signal": 0,
+            },
+        ]
+    )
+    strategy.dp = SimpleNamespace(get_analyzed_dataframe=lambda *args: (dataframe, None))
+
+    adjustment = strategy.adjust_trade_position(
+        trade=trade,
+        current_time=datetime(2026, 1, 1, 1, 1, tzinfo=UTC),
+        current_rate=101.9,
+        current_profit=-0.1,
+        min_stake=None,
+        max_stake=1000.0,
+        current_entry_rate=101.9,
+        current_exit_rate=101.8,
+        current_entry_profit=-0.1,
+        current_exit_profit=-0.1,
+    )
+
+    assert adjustment is None
+    assert custom_data[strategy.LAST_DCA_SIGNAL_KEY] == str(signal_time)
+
+
 @pytest.mark.parametrize(
     ("is_short", "tp_signal", "exit_tag"),
     [
@@ -640,35 +833,6 @@ def test_take_profit_uses_fee_aware_atr_target_and_arms_reversal(
         datetime(2026, 1, 1, 1, 0, tzinfo=UTC),
         tp_target_rate,
     ) == (-trade.stake_amount, exit_tag)
-
-
-def test_signal_stop_loss_requires_completed_ladder_same_direction_and_distance(caplog) -> None:
-    strategy = _strategy()
-    strategy.max_safe_orders.value = 1
-    strategy.use_signal_stop_loss.value = True
-    trade = _trade(False, (100.0, 97.0))
-    candle = Series(
-        {
-            "date": datetime(2026, 1, 1, 1, 0, tzinfo=UTC),
-            "close": 94.9,
-            "atr": 1.0,
-            "sl_signal": 1,
-        }
-    )
-
-    with caplog.at_level(logging.INFO, logger="user_data.strategies.adx_vw_dca_strategy"):
-        assert strategy._signal_stop_loss_adjustment(trade, candle) == (
-            -trade.stake_amount,
-            strategy.SIGNAL_STOP_LOSS_EXIT_TAG,
-        )
-
-    assert [record.getMessage() for record in caplog.records] == [
-        "Signal SL | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | close 94.9 | "
-        "required <= 95 | last entry 97 | ATR distance 1 x2 = 2"
-    ]
-
-    candle["close"] = 95.1
-    assert strategy._signal_stop_loss_adjustment(trade, candle) is None
 
 
 def test_emergency_break_even_requires_enabled_completed_ladder(monkeypatch) -> None:
@@ -758,7 +922,6 @@ def test_adjust_trade_position_logs_emergency_break_even_limit(caplog, monkeypat
                 "atr": 1.0,
                 "signal": "",
                 "tp_signal": 0,
-                "sl_signal": 0,
             }
         ]
     )
@@ -783,93 +946,24 @@ def test_adjust_trade_position_logs_emergency_break_even_limit(caplog, monkeypat
     assert adjustment == (-trade.stake_amount, "🛟")
     assert [record.getMessage() for record in caplog.records] == [
         (
-            "Emergency BE limit | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
-            f"target {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
+            "Emergency BE | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+            f"limit {strategy._format_log_number(trade.calc_close_rate_for_roi(0.0))}"
         )
     ]
 
 
 @pytest.mark.parametrize(
-    ("previous_short", "entry_tag", "side"),
+    ("entry_tag", "side"),
     [
-        (False, ADXVWDCAStrategy.SHORT_REVERSE_TAG, "short"),
-        (True, ADXVWDCAStrategy.LONG_REVERSE_TAG, "long"),
+        (ADXVWDCAStrategy.LONG_REVERSE_TAG, "long"),
+        (ADXVWDCAStrategy.SHORT_REVERSE_TAG, "short"),
     ],
 )
-def test_recent_matching_reverse_exit_allows_opposite_entry(
+def test_reverse_entry_opens_when_pair_is_flat(
     monkeypatch,
-    previous_short: bool,
     entry_tag: str,
     side: str,
 ) -> None:
-    strategy = _strategy()
-    current_time = datetime(2026, 1, 1, 1, 1, tzinfo=UTC)
-    previous_trade = SimpleNamespace(
-        is_short=previous_short,
-        exit_reason=strategy.TAKE_PROFIT_EXIT_TAG,
-        close_date_utc=current_time - timedelta(minutes=1),
-    )
-    monkeypatch.setattr(
-        Trade,
-        "get_trades_proxy",
-        staticmethod(lambda **kwargs: [previous_trade]),
-    )
-
-    assert strategy.confirm_trade_entry(
-        pair="ETH/USDT:USDT",
-        order_type="market",
-        amount=1.0,
-        rate=100.0,
-        time_in_force="gtc",
-        current_time=current_time,
-        entry_tag=entry_tag,
-        side=side,
-    )
-
-
-@pytest.mark.parametrize(
-    ("side", "entry_tag", "previous_short", "exit_reason", "age_minutes"),
-    [
-        ("short", ADXVWDCAStrategy.SHORT_REVERSE_TAG, False, "🛟", 1),
-        ("short", ADXVWDCAStrategy.SHORT_REVERSE_TAG, True, "🎯", 1),
-        ("short", ADXVWDCAStrategy.SHORT_REVERSE_TAG, False, "🎯", 2),
-        ("long", ADXVWDCAStrategy.LONG_REVERSE_TAG, False, "🎯", 1),
-    ],
-)
-def test_reverse_entry_rejects_wrong_or_stale_closed_trade(
-    monkeypatch,
-    side: str,
-    entry_tag: str,
-    previous_short: bool,
-    exit_reason: str,
-    age_minutes: int,
-) -> None:
-    strategy = _strategy()
-    current_time = datetime(2026, 1, 1, 1, 2, tzinfo=UTC)
-    previous_trade = SimpleNamespace(
-        is_short=previous_short,
-        exit_reason=exit_reason,
-        close_date_utc=current_time - timedelta(minutes=age_minutes),
-    )
-    monkeypatch.setattr(
-        Trade,
-        "get_trades_proxy",
-        staticmethod(lambda **kwargs: [previous_trade]),
-    )
-
-    assert not strategy.confirm_trade_entry(
-        pair="ETH/USDT:USDT",
-        order_type="market",
-        amount=1.0,
-        rate=100.0,
-        time_in_force="gtc",
-        current_time=current_time,
-        entry_tag=entry_tag,
-        side=side,
-    )
-
-
-def test_ordinary_entry_does_not_require_closed_trade_history(monkeypatch) -> None:
     strategy = _strategy()
     monkeypatch.setattr(
         Trade,
@@ -884,21 +978,20 @@ def test_ordinary_entry_does_not_require_closed_trade_history(monkeypatch) -> No
         rate=100.0,
         time_in_force="gtc",
         current_time=datetime(2026, 1, 1, tzinfo=UTC),
-        entry_tag=strategy.LONG_ENTRY_TAG,
-        side="long",
+        entry_tag=entry_tag,
+        side=side,
     )
 
 
-def test_leverage_uses_requested_exchange_tier() -> None:
+def test_leverage_respects_exchange_cap_and_buffered_tier() -> None:
     strategy = _strategy()
     pair = "LTC/USDT:USDT"
     strategy.dp = SimpleNamespace(
         _exchange=SimpleNamespace(
             _leverage_tiers={
                 pair: [
-                    {"minNotional": 0.0, "maxLeverage": 50.0},
-                    {"minNotional": 500.1, "maxLeverage": 40.0},
-                    {"minNotional": 2000.1, "maxLeverage": 20.0},
+                    {"minNotional": 0.0, "maxNotional": 5000.0, "maxLeverage": 50.0},
+                    {"minNotional": 5000.0, "maxNotional": 10000.0, "maxLeverage": 25.0},
                 ]
             }
         )
@@ -910,9 +1003,10 @@ def test_leverage_uses_requested_exchange_tier() -> None:
             current_time=datetime(2026, 1, 1, tzinfo=UTC),
             current_rate=100.0,
             proposed_leverage=1.0,
-            max_leverage=50.0,
+            max_leverage=20.0,
             entry_tag=strategy.LONG_ENTRY_TAG,
             side="long",
+            proposed_stake=100.0,
         )
         == 20.0
     )
@@ -941,6 +1035,10 @@ def test_take_profit_log_is_emitted_once_per_candle(caplog) -> None:
             )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert len(messages) == 1
-    assert messages[0].startswith("TP skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 |")
-    assert "ATR distance 1 x1 = 1" in messages[0]
+    tp_target_rate = break_even + 1.0
+    assert messages == [
+        "TP skipped | #71 ETH/USDT:USDT long | 2026-01-01 01:00 | "
+        f"exit {strategy._format_log_number(break_even)} < "
+        f"target {strategy._format_log_number(tp_target_rate)} | remaining 1 | "
+        f"target = BE {strategy._format_log_number(break_even)} + 1 x ATR 1"
+    ]
