@@ -41,7 +41,7 @@ class Wallets:
         self._is_backtest = is_backtest
         self._exchange = exchange
         self._wallets: dict[str, Wallet] = {}
-        self._positions: dict[str, PositionWallet] = {}
+        self._positions: dict[tuple[str, str], PositionWallet] = {}
         self._start_cap: dict[str, float] = {}
 
         self._stake_currency = self._exchange.get_proxy_coin()
@@ -93,15 +93,24 @@ class Wallets:
             )
         return self.get_total(self._stake_currency)
 
-    def get_owned(self, pair: str, base_currency: str) -> float:
+    def get_owned(self, pair: str, base_currency: str, side: str | None = None) -> float:
         """
         Get currently owned value.
         Designed to work across both spot and futures.
         """
         if self._config.get("trading_mode", "spot") != TradingMode.FUTURES:
             return self.get_total(base_currency) or 0
-        if pos := self._positions.get(pair):
-            return pos.position
+        if side is not None:
+            if pos := self._positions.get((pair, side)):
+                return pos.position
+            return 0
+        matching_positions = [pos for (symbol, _), pos in self._positions.items() if symbol == pair]
+        if len(matching_positions) > 1:
+            raise DependencyException(
+                f"Cannot determine owned amount for {pair}: multiple position sides are open."
+            )
+        if matching_positions:
+            return matching_positions[0].position
         return 0
 
     def _update_dry(self) -> None:
@@ -146,11 +155,13 @@ class Wallets:
                 )
         else:
             for position in open_trades:
-                _positions[position.pair] = PositionWallet(
+                key = (position.pair, position.trade_direction)
+                existing = _positions.get(key)
+                _positions[key] = PositionWallet(
                     position.pair,
-                    position=position.amount,
+                    position=position.amount + (existing.position if existing else 0),
                     leverage=position.leverage,
-                    collateral=position.stake_amount,
+                    collateral=position.stake_amount + (existing.collateral if existing else 0),
                     side=position.trade_direction,
                 )
 
@@ -201,29 +212,40 @@ class Wallets:
         _parsed_positions = {}
         for position in positions:
             symbol = position["symbol"]
-            if position["side"] is None or position["collateral"] == 0.0:
+            contracts = float(position.get("contracts") or 0.0)
+            if position["side"] is None or contracts == 0.0:
                 # Position is not open ...
                 continue
-            size = self._exchange._contracts_to_amount(symbol, position["contracts"])
+            size = abs(self._exchange._contracts_to_amount(symbol, contracts))
             collateral = safe_value_fallback(position, "initialMargin", "collateral", 0.0)
             leverage: float | None = position.get("leverage")
             if not leverage:
-                trade = Trade.get_trades_proxy(is_open=True, pair=symbol)
-                leverage = trade[0].leverage if trade else None
+                trades = Trade.get_trades_proxy(is_open=True, pair=symbol)
+                trade = next(
+                    (
+                        candidate
+                        for candidate in trades
+                        if candidate.trade_direction == position["side"]
+                    ),
+                    None,
+                )
+                leverage = trade.leverage if trade else None
             unrealized_pnl = float(position.get("unrealizedPnl") or 0.0)  # type: ignore[arg-type]
-            _parsed_positions[symbol] = PositionWallet(
+            key = (symbol, position["side"])
+            existing = _parsed_positions.get(key)
+            _parsed_positions[key] = PositionWallet(
                 symbol,
-                position=size,
+                position=size + (existing.position if existing else 0),
                 leverage=leverage,
-                collateral=collateral,
+                collateral=collateral + (existing.collateral if existing else 0),
                 side=position["side"],
-                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl=unrealized_pnl + (existing.unrealized_pnl if existing else 0),
             )
         self._positions = _parsed_positions
         self._wallets = self._strip_unrealized_pnl(_wallets, _parsed_positions)
 
     def _strip_unrealized_pnl(
-        self, wallets: dict[str, Wallet], positions: dict[str, PositionWallet]
+        self, wallets: dict[str, Wallet], positions: dict[tuple[str, str], PositionWallet]
     ) -> dict[str, Wallet]:
         """
         Restore the Wallet.total for exchanges reporting account equity.
@@ -266,7 +288,7 @@ class Wallets:
     def get_all_balances(self) -> dict[str, Wallet]:
         return self._wallets
 
-    def get_all_positions(self) -> dict[str, PositionWallet]:
+    def get_all_positions(self) -> dict[tuple[str, str], PositionWallet]:
         return self._positions
 
     def _check_exit_amount(self, trade: Trade) -> bool:
@@ -275,7 +297,7 @@ class Wallets:
             wallet_amount: float = self.get_total(trade.safe_base_currency) * (2 - 0.981)
         else:
             # wallet_amount: float = self.wallets.get_free(trade.safe_base_currency)
-            position = self._positions.get(trade.pair)
+            position = self._positions.get((trade.pair, trade.trade_direction))
             if position is None:
                 # We don't own anything :O
                 return False

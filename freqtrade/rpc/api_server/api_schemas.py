@@ -1,7 +1,15 @@
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, Field, RootModel, SerializeAsAny, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    Field,
+    RootModel,
+    SerializeAsAny,
+    model_serializer,
+    model_validator,
+)
 
 from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
 from freqtrade.enums import (
@@ -292,6 +300,15 @@ class OrderSchema(BaseModel):
 
 
 class TradeSchema(BaseModel):
+    hedge: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_hedge(self, handler):
+        data = handler(self)
+        if self.hedge is None:
+            data.pop("hedge", None)
+        return data
+
     trade_id: int
     pair: str
     base_currency: str

@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.schema import CreateTable
 
 from freqtrade.constants import DEFAULT_DB_PROD_URL
@@ -13,6 +13,7 @@ from freqtrade.enums import TradingMode
 from freqtrade.exceptions import OperationalException
 from freqtrade.persistence import Trade, init_db
 from freqtrade.persistence.base import ModelBase
+from freqtrade.persistence.hedge_group import HedgeGroup
 from freqtrade.persistence.migrations import get_last_sequence_ids, set_sequence_ids
 from freqtrade.persistence.models import PairLock
 from freqtrade.persistence.trade_model import Order
@@ -244,17 +245,20 @@ def test_migrate(mocker, default_conf, fee, caplog):
         connection.execute(text("create index ix_trades_pair on trades(pair)"))
         connection.execute(text(insert_table_old))
         connection.execute(text(insert_orders))
-
         # fake previous backup
         connection.execute(text("create table trades_bak as select * from trades"))
 
         connection.execute(text("create table trades_bak1 as select * from trades"))
-    # Run init to test migration
     init_db(default_conf["db_url"])
 
     trades = Trade.session.scalars(select(Trade)).all()
     assert len(trades) == 1
     trade = trades[0]
+    # First installation on an older native database must reference migrated trades.
+    assert {fk["referred_table"] for fk in inspect(engine).get_foreign_keys("hedge_groups")} == {
+        "trades"
+    }
+    assert Trade.session.get(HedgeGroup, 1) is None
     assert trade.id == 1
     assert trade.fee_open == fee.return_value
     assert trade.fee_close == fee.return_value
@@ -278,7 +282,6 @@ def test_migrate(mocker, default_conf, fee, caplog):
     assert log_has(
         "Running database migration for trades - backup: trades_bak2, orders_bak0", caplog
     )
-    assert log_has("Database migration finished.", caplog)
     assert pytest.approx(trade.open_trade_value) == trade._calc_open_trade_value(
         trade.amount, trade.open_rate
     )

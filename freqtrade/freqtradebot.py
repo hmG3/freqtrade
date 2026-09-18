@@ -43,10 +43,12 @@ from freqtrade.exchange import (
     timeframe_to_seconds,
 )
 from freqtrade.exchange.exchange_types import CcxtOrder
+from freqtrade.hedging import HedgeManager
 from freqtrade.leverage.liquidation_price import update_liquidation_prices
 from freqtrade.misc import safe_value_fallback, safe_value_fallback2
 from freqtrade.mixins import LoggingMixin
 from freqtrade.persistence import Order, PairLocks, Trade, init_db
+from freqtrade.persistence.hedge_group import HedgeGroup
 from freqtrade.persistence.key_value_store import set_startup_time
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
@@ -114,6 +116,7 @@ class FreqtradeBot(LoggingMixin):
             self.trading_mode: TradingMode = self.config.get("trading_mode", TradingMode.SPOT)
             self.margin_mode: MarginMode = self.config.get("margin_mode", MarginMode.NONE)
             self.last_process: datetime | None = None
+            self.hedges = HedgeManager(self)
 
             # RPC runs in separate threads, can start handling external commands just after
             # initialization, even before Freqtradebot has a chance to start its throttling,
@@ -176,6 +179,7 @@ class FreqtradeBot(LoggingMixin):
             self._schedule.every().day.at("00:07").do(self.wallets.record_wallet_state)
 
             self.strategy.ft_bot_start()
+            self.hedges.validate()
             # Initialize protections AFTER bot start - otherwise parameters are not loaded.
             self.protections = ProtectionManager(self.config, self.strategy.protections)
 
@@ -255,7 +259,9 @@ class FreqtradeBot(LoggingMixin):
 
         # Only update open orders on startup
         # This will update the database after the initial migration
-        self.startup_update_open_orders()
+        with self._exit_lock:
+            self.startup_update_open_orders()
+            self.hedges.recover()
         self.update_all_liquidation_prices()
         self.update_funding_fees()
 
@@ -290,6 +296,9 @@ class FreqtradeBot(LoggingMixin):
 
         # Check whether markets have to be reloaded and reload them when it's needed
         self.exchange.reload_markets()
+
+        with self._exit_lock:
+            self.hedges.process()
 
         self.update_trades_without_assigned_fees()
 
@@ -438,6 +447,9 @@ class FreqtradeBot(LoggingMixin):
         orders = Order.get_open_orders()
         logger.info(f"Updating {len(orders)} open orders.")
         for order in orders:
+            if order.trade and self.hedges.manages(order.trade):
+                # Hedge recovery must never use this method's synthetic cancellation fallback.
+                continue
             try:
                 fo = self.exchange.fetch_order_or_stoploss_order(
                     order.order_id,
@@ -546,6 +558,19 @@ class FreqtradeBot(LoggingMixin):
             except ExchangeError:
                 logger.warning(f"Error updating {order.order_id}.")
 
+    def _can_adopt_exchange_order(self, trade: Trade, order: CcxtOrder) -> bool:
+        existing = Order.order_by_id(order["id"], trade.pair)
+        if existing is not None and existing.ft_trade_id != trade.id:
+            logger.info(
+                f"Order {order['id']} for {trade.pair} already belongs to "
+                f"trade {existing.ft_trade_id} - skipping."
+            )
+            return False
+        if not self.hedges.can_adopt_order(trade, order):
+            logger.info("Order %s lacks position-side ownership - skipping.", order["id"])
+            return False
+        return True
+
     def handle_onexchange_order(self, trade: Trade) -> bool:
         """
         Try refinding a order that is not in the database.
@@ -567,13 +592,7 @@ class FreqtradeBot(LoggingMixin):
                     # We knew this order, but didn't have it updated properly
                     order_obj = trade_order[0]
                 else:
-                    existing_order = Order.order_by_id(order["id"], trade.pair)
-                    if existing_order is not None and existing_order.ft_trade_id != trade.id:
-                        # Order belongs to a different trade
-                        logger.info(
-                            f"Order {order['id']} for {trade.pair} already belongs to "
-                            f"trade {existing_order.ft_trade_id} - skipping."
-                        )
+                    if not self._can_adopt_exchange_order(trade, order):
                         continue
 
                     logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
@@ -605,7 +624,7 @@ class FreqtradeBot(LoggingMixin):
             else:
                 trade.exit_reason = prev_exit_reason
                 total = (
-                    self.wallets.get_owned(trade.pair, trade.base_currency)
+                    self.wallets.get_owned(trade.pair, trade.base_currency, trade.trade_direction)
                     if trade.base_currency
                     else 0
                 )
@@ -623,7 +642,9 @@ class FreqtradeBot(LoggingMixin):
                         )
                         trade.delete()
                         return True
-                    if total > trade.amount * 0.98:
+                    # Hedge quantities must be backed by fills; a wallet estimate
+                    # could otherwise make the manager reopen a reduced position.
+                    if total > trade.amount * 0.98 and not self.hedges.manages(trade):
                         logger.warning(
                             f"{trade} has a total of {trade.amount} {trade.base_currency}, "
                             f"but the Wallet shows a total of {total} {trade.base_currency}. "
@@ -635,7 +656,7 @@ class FreqtradeBot(LoggingMixin):
                         logger.warning(
                             f"{trade} has a total of {trade.amount} {trade.base_currency}, "
                             f"but the Wallet shows a total of {total} {trade.base_currency}. "
-                            "Refusing to adjust as the difference is too large. "
+                            "Refusing to adjust as the difference requires identifiable fills. "
                             "This may however lead to further issues."
                         )
                 if prev_trade_amount != trade.amount:
@@ -802,6 +823,8 @@ class FreqtradeBot(LoggingMixin):
         If the strategy triggers the adjustment, a new order gets issued.
         Once that completes, the existing trade is modified to match new data.
         """
+        if self.hedges.manages(trade):
+            return
         current_entry_rate, current_exit_rate = self.exchange.get_rates(
             trade.pair, True, trade.is_short
         )
@@ -957,7 +980,7 @@ class FreqtradeBot(LoggingMixin):
             pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_, order_type
         )
 
-        if not stake_amount:
+        if not stake_amount or self.hedges.manages_pair(pair):
             return False
 
         msg = (
@@ -1197,9 +1220,7 @@ class FreqtradeBot(LoggingMixin):
                 leverage = leverage_
             else:
                 leverage_kwargs = {"proposed_stake": stake_amount} if custom_tier_selection else {}
-                callback_max_leverage = (
-                    min(max_leverage, leverage_) if leverage_ else max_leverage
-                )
+                callback_max_leverage = min(max_leverage, leverage_) if leverage_ else max_leverage
                 leverage = strategy_safe_wrapper(self.strategy.leverage, default_retval=1.0)(
                     pair=pair,
                     current_time=datetime.now(UTC),
@@ -1358,6 +1379,8 @@ class FreqtradeBot(LoggingMixin):
         """
         trades_closed = 0
         for trade in trades:
+            if self.hedges.manages(trade):
+                continue
             if (
                 not trade.has_open_orders
                 and not trade.has_open_sl_orders
@@ -1403,6 +1426,8 @@ class FreqtradeBot(LoggingMixin):
         Exits the current pair if the threshold is reached and updates the trade record.
         :return: True if trade has been sold/exited_short, False otherwise
         """
+        if self.hedges.manages(trade):
+            return False
         if not trade.is_open:
             raise DependencyException(f"Attempt to handle closed trade: {trade}")
 
@@ -1427,6 +1452,9 @@ class FreqtradeBot(LoggingMixin):
         exit_rate = self.exchange.get_rate(
             trade.pair, side="exit", is_short=trade.is_short, refresh=True
         )
+        if self.hedges.evaluate(trade, exit_rate):
+            self.hedges.process()
+            return False
         if self._check_and_execute_exit(trade, exit_rate, enter, exit_, exit_tag):
             return True
 
@@ -1475,6 +1503,8 @@ class FreqtradeBot(LoggingMixin):
         Force-sells the pair (using EmergencySell reason) in case of Problems creating the order.
         :return: True if the order succeeded, and False in case of problems.
         """
+        if self.hedges.manages(trade):
+            return False
         try:
             stoploss_order = self.exchange.create_stoploss(
                 pair=trade.pair,
@@ -1513,6 +1543,8 @@ class FreqtradeBot(LoggingMixin):
         # Therefore fetching account liquidations for open pairs may make sense.
         """
 
+        if self.hedges.manages(trade):
+            return False
         logger.debug("Handling stoploss on exchange %s ...", trade)
 
         stoploss_orders = []
@@ -1647,6 +1679,9 @@ class FreqtradeBot(LoggingMixin):
         :return: None
         """
         for trade in Trade.get_open_trades():
+            if self.hedges.manages(trade):
+                continue
+            reconciled_orders = []
             open_order: Order
             for open_order in trade.open_orders:
                 try:
@@ -1661,18 +1696,43 @@ class FreqtradeBot(LoggingMixin):
                     continue
 
                 fully_cancelled = self.update_trade_state(trade, open_order.order_id, order)
-                not_closed = order["status"] == "open" or fully_cancelled
+                if self.hedges.manages(trade):
+                    break
+                reconciled_orders.append((open_order, order, fully_cancelled))
 
-                if not_closed:
-                    if fully_cancelled or (
-                        open_order
-                        and self.strategy.ft_check_timed_out(trade, open_order, datetime.now(UTC))
-                    ):
-                        self.handle_cancel_order(
-                            order, open_order, trade, constants.CANCEL_REASON["TIMEOUT"]
-                        )
-                    else:
-                        self.replace_order(order, open_order, trade)
+            if self.hedges.manages(trade):
+                continue
+            if reconciled_orders and self.hedges.enabled and trade.is_open and trade.amount > 0:
+                try:
+                    rate = self.exchange.get_rate(
+                        trade.pair, side="exit", is_short=trade.is_short, refresh=True
+                    )
+                    if self.hedges.evaluate(trade, rate):
+                        self.hedges.process()
+                        continue
+                except (ExchangeError, PricingError):
+                    logger.warning(
+                        "Cannot price hedge decision for %s; defer order management.", trade
+                    )
+                    continue
+
+            # Reconcile fills first, then give the strategy hedge precedence over
+            # replacements and timeout emergency exits as well as ordinary exits.
+            for open_order, order, fully_cancelled in reconciled_orders:
+                self._manage_order_after_hedge_check(trade, open_order, order, fully_cancelled)
+
+    def _manage_order_after_hedge_check(
+        self, trade: Trade, open_order: Order, order: CcxtOrder, fully_cancelled: bool
+    ) -> None:
+        if order["status"] == "open" or fully_cancelled:
+            if fully_cancelled or self.strategy.ft_check_timed_out(
+                trade, open_order, datetime.now(UTC)
+            ):
+                self.handle_cancel_order(
+                    order, open_order, trade, constants.CANCEL_REASON["TIMEOUT"]
+                )
+            else:
+                self.replace_order(order, open_order, trade)
 
     def handle_cancel_order(
         self, order: CcxtOrder, order_obj: Order, trade: Trade, reason: str, replacing: bool = False
@@ -1883,6 +1943,8 @@ class FreqtradeBot(LoggingMixin):
         """
 
         for trade in Trade.get_open_trades():
+            if getattr(self, "hedges", None) and self.hedges.manages(trade):
+                continue
             self.cancel_open_orders_of_trade(
                 trade, [trade.entry_side, trade.exit_side], constants.CANCEL_REASON["ALL_CANCELLED"]
             )
@@ -2151,6 +2213,8 @@ class FreqtradeBot(LoggingMixin):
         :param exit_check: CheckTuple with signal and reason
         :return: True if it succeeds False
         """
+        if self.hedges.manages(trade):
+            return False
         trade.set_funding_fees(
             self.exchange.get_funding_fees(
                 pair=trade.pair,
@@ -2414,6 +2478,11 @@ class FreqtradeBot(LoggingMixin):
         order_obj_or_none = trade.select_order_by_order_id(order_id)
         order_obj = self.order_obj_or_raise(order_id, order_obj_or_none)
 
+        hedge_group = HedgeGroup.for_trade(trade.id) if self.hedges.enabled else None
+        if hedge_group and order_id in hedge_group.accounted_orders:
+            # An immutable terminal fill was already accounted, possibly just before a crash.
+            return False
+
         # Update trade with order values
         if not stoploss_order:
             logger.info(f"Found open order for {trade}")
@@ -2425,6 +2494,12 @@ class FreqtradeBot(LoggingMixin):
             logger.warning("Unable to fetch order %s: %s", order_id, exception)
             return False
 
+        if (
+            hedge_group
+            and order.get("status") in constants.NON_OPEN_EXCHANGE_STATES
+            and (order.get("filled") is None or (order["filled"] > 0 and not order.get("average")))
+        ):
+            return False
         trade.update_order(order)
 
         if self.exchange.check_order_canceled_empty(order):
@@ -2434,20 +2509,39 @@ class FreqtradeBot(LoggingMixin):
 
         self.handle_order_fee(trade, order_obj, order)
 
-        trade.update_trade(order_obj, not send_msg)
+        if hedge_group and order_obj.status in constants.NON_OPEN_EXCHANGE_STATES:
+            try:
+                trade.update_trade(order_obj, not send_msg, commit=False)
+                hedge_group.accounted_orders = [*hedge_group.accounted_orders, order_id]
+                Trade.commit()
+            except Exception:
+                Trade.session.rollback()
+                raise
+        else:
+            trade.update_trade(order_obj, not send_msg)
 
         trade = self._update_trade_after_fill(trade, order_obj, send_msg)
         Trade.commit()
 
         self.order_close_notify(trade, order_obj, stoploss_order, send_msg)
 
+        if self.hedges.manages(trade):
+            self.hedges.process()
+
         return False
 
     def _update_trade_after_fill(self, trade: Trade, order: Order, send_msg: bool) -> Trade:
         if order.status in constants.NON_OPEN_EXCHANGE_STATES:
+            if self.hedges.manages(trade):
+                self.wallets.update()
+                return trade
             strategy_safe_wrapper(self.strategy.order_filled, supress_error=True)(
                 pair=trade.pair, trade=trade, order=order, current_time=datetime.now(UTC)
             )
+            self.hedges.observe_fill(trade, order)
+            if self.hedges.manages(trade):
+                self.wallets.update()
+                return trade
             # If a entry order was closed, force update on stoploss on exchange
             if order.ft_order_side == trade.entry_side:
                 if send_msg:

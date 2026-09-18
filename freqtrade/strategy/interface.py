@@ -446,6 +446,41 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
         """
 
+    # Price-triggered hedges at a stop line cannot race an exchange stop there.
+    hedge_requires_local_stoploss: bool = False
+
+    def validate_hedge(self, **kwargs) -> None:
+        """Validate strategy-specific hedge settings at startup when hedging is enabled.
+
+        Called after strategy parameters are loaded. Raise OperationalException
+        for incompatible settings. The default needs no additional validation.
+        """
+
+    def custom_hedge(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        order: Order | None = None,
+        **kwargs,
+    ) -> str | None:
+        """Request a full opposite position by returning a nonempty reason (max 255 chars).
+
+        Enabled with hedge.enabled, live/dry-run only.
+        Called before local automatic exits with a fresh executable exit quote,
+        and after order_filled for terminal positive fills with their fill price.
+        Fill calls include order; periodic calls use order=None. Startup can replay
+        historical order_filled/custom_hedge pairs; make both callbacks idempotent
+        by order ID. Linked groups are excluded. Return None for no action.
+
+        The bot persists intent, cancels outstanding orders, hedges the entire
+        remaining amount, and suspends adjustments/exits until manual closure.
+        Return a decision only; do not submit exchange orders here.
+        """
+        return None
+
     def custom_stoploss(
         self,
         pair: str,

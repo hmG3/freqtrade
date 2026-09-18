@@ -38,12 +38,18 @@ from freqtrade.enums import (
     State,
     TradingMode,
 )
-from freqtrade.exceptions import ExchangeError, PricingError
+from freqtrade.exceptions import (
+    DependencyException,
+    ExchangeError,
+    OperationalException,
+    PricingError,
+)
 from freqtrade.exchange import Exchange, timeframe_to_minutes, timeframe_to_msecs
 from freqtrade.exchange.exchange_utils import price_to_precision
 from freqtrade.ft_types import AnnotationType
 from freqtrade.loggers import bufferHandler
 from freqtrade.persistence import CustomDataWrapper, KeyValueStore, Order, PairLocks, Trade
+from freqtrade.persistence.hedge_group import HedgeGroup
 from freqtrade.persistence.models import PairLock, custom_data_rpc_wrapper
 from freqtrade.plugins.pairlist.pairlist_helpers import expand_pairlist
 from freqtrade.rpc.fiat_convert import CryptoToFiatConverter
@@ -275,6 +281,8 @@ class RPC:
                 stoploss_current_dist_ratio = stoploss_current_dist / current_rate
 
                 trade_dict = trade.to_json()
+                if self._freqtrade.hedges.enabled and (group := HedgeGroup.for_trade(trade.id)):
+                    trade_dict["hedge"] = group.to_json()
                 trade_dict.update(
                     {
                         "close_profit": trade.close_profit if not trade.is_open else None,
@@ -890,9 +898,9 @@ class RPC:
                     "is_position": False,
                 }
             )
-        symbol: str
         pos: PositionWallet
-        for symbol, pos in self._freqtrade.wallets.get_all_positions().items():
+        for pos in self._freqtrade.wallets.get_all_positions().values():
+            symbol = pos.symbol
             est_stake = pos.collateral
             pos_base = self._freqtrade.exchange.get_pair_base_currency(symbol)
             if pos.leverage and pos.position:
@@ -1027,6 +1035,12 @@ class RPC:
         amount: float | None = None,
         price: float | None = None,
     ) -> bool:
+        if self._freqtrade.hedges.manages(trade):
+            if amount is not None or price is not None or ordertype not in (None, "market"):
+                raise RPCException(
+                    "Linked hedge trades require a full market group close; omit amount and price."
+                )
+            return self._freqtrade.hedges.request_close(trade)
         if ordertype == "chase":
             raise RPCException("Chase orders are not supported for force exit.")
 
@@ -1109,12 +1123,28 @@ class RPC:
 
         with self._freqtrade._exit_lock:
             if trade_id == "all":
+                if (
+                    self._freqtrade.hedges.enabled
+                    and HedgeGroup.active()
+                    and (
+                        amount is not None or price is not None or ordertype not in (None, "market")
+                    )
+                ):
+                    raise RPCException(
+                        "Linked hedge trades require full market group closes without amount/price."
+                    )
                 # Execute exit for all open orders
                 for trade in Trade.get_open_trades():
                     self.__exec_force_exit(trade, ordertype)
                 Trade.commit()
                 self._freqtrade.wallets.update()
-                return {"result": "Created exit orders for all open trades."}
+                return {
+                    "result": (
+                        "Requested closure of all open trades and linked hedge groups."
+                        if self._freqtrade.hedges.enabled
+                        else "Created exit orders for all open trades."
+                    )
+                }
 
             # Query for trade
             trade = (
@@ -1136,9 +1166,42 @@ class RPC:
             self._freqtrade.wallets.update()
             if not result:
                 raise RPCException("Failed to exit trade.")
+            if self._freqtrade.hedges.enabled and HedgeGroup.for_trade(trade.id):
+                return {
+                    "result": f"Requested closure of both hedge legs linked to trade {trade_id}."
+                }
             return {"result": f"Created exit order for trade {trade_id}."}
 
+    def _rpc_hedge(self, trade_id: str) -> dict[str, Any]:
+        """Manually apply the automatic hedge lifecycle to one existing position."""
+        if self._freqtrade.state not in (State.RUNNING, State.PAUSED):
+            raise RPCException("trader is not running")
+        if not self._freqtrade.hedges.enabled:
+            raise RPCException("Enable hedge before requesting a hedge.")
+        if not trade_id.isdecimal() or int(trade_id) <= 0:
+            raise RPCException("A positive trade ID is required.")
+        with self._freqtrade._exit_lock:
+            trade = Trade.session.get(Trade, int(trade_id))
+            if trade is None:
+                raise RPCException("Trade not found.")
+            try:
+                group = self._freqtrade.hedges.request_open(trade)
+            except (DependencyException, OperationalException) as exc:
+                raise RPCException(str(exc)) from exc
+            self._freqtrade.hedges.process()
+            message = (
+                f"Hedge group for trade {group.parent_id}: {group.state}. "
+                f"Entry type: {group.order_type}. "
+                "Automatic exits and DCA are suspended for active groups. "
+                "Use /forceexit on either trade to close both legs."
+            )
+            if group.last_error:
+                message += f" {group.last_error}"
+            return {"result": message, "hedge": group.to_json()}
+
     def _force_entry_validations(self, pair: str, order_side: SignalDirection):
+        if self._freqtrade.hedges.manages_pair(pair):
+            raise RPCException("DCA and force-entry are disabled for a linked hedge group.")
         if not self._freqtrade.config.get("force_entry_enable", False):
             raise RPCException("Force_entry not enabled.")
 
@@ -1245,6 +1308,9 @@ class RPC:
                 logger.warning("cancel_open_order: No open order for trade_id.")
                 raise RPCException("No open order for trade_id.")
 
+            if self._freqtrade.hedges.manages(trade):
+                raise RPCException("Use force-exit to close both linked hedge legs.")
+
             for open_order in trade.open_orders:
                 try:
                     order = self._freqtrade.exchange.fetch_order_or_stoploss_order(
@@ -1269,6 +1335,11 @@ class RPC:
             if not trade:
                 logger.warning("delete trade: Invalid argument received")
                 raise RPCException(f"Trade with id '{trade_id}' not found.")
+
+            if HedgeGroup.for_trade(trade.id):
+                raise RPCException(
+                    "Linked hedge history cannot be deleted. Use force-exit to close it."
+                )
 
             # Try cancelling regular order if that exists
             for open_order in trade.open_orders:

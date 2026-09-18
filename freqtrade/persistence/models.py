@@ -16,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 from freqtrade.exceptions import OperationalException
 from freqtrade.persistence.base import ModelBase
 from freqtrade.persistence.custom_data import _CustomData
+from freqtrade.persistence.hedge_group import HedgeGroup
 from freqtrade.persistence.key_value_store import _KeyValueStoreModel
 from freqtrade.persistence.migrations import check_migrate
 from freqtrade.persistence.pairlock import PairLock
@@ -93,9 +94,15 @@ def init_db(db_url: str) -> None:
         sessionmaker(bind=engine, autoflush=True), scopefunc=get_request_or_thread_id
     )
     WalletHistory.session = Trade.session
+    HedgeGroup.session = Trade.session
 
     previous_tables = inspect(engine).get_table_names()
-    ModelBase.metadata.create_all(engine)
+    # Create the hedge table only after native trade migrations, so its foreign
+    # keys cannot follow a pre-feature trades table when that table is renamed.
+    ModelBase.metadata.create_all(
+        engine,
+        tables=[t for t in ModelBase.metadata.sorted_tables if t is not HedgeGroup.__table__],
+    )
     check_migrate(engine, decl_base=ModelBase, previous_tables=previous_tables)
 
 

@@ -907,7 +907,9 @@ class LocalTrade:
             f"{float(self.stop_loss) - float(self.initial_stop_loss or 0.0):.8f}."
         )
 
-    def update_trade(self, order: Order, recalculating: bool = False) -> None:
+    def update_trade(
+        self, order: Order, recalculating: bool = False, *, commit: bool = True
+    ) -> None:
         """
         Updates this entity with amount and actual open/close rates.
         :param order: order retrieved by exchange.fetch_order()
@@ -960,7 +962,8 @@ class LocalTrade:
             else:
                 self.recalc_trade_from_orders()
 
-        Trade.commit()
+        if commit:
+            Trade.commit()
 
     def close(self, rate: float, *, show_msg: bool = True) -> None:
         """

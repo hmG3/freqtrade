@@ -32,9 +32,30 @@ __IN_STRATEGY = "\nUsually specified in the strategy and missing in the configur
 
 __VIA_ENV = "Recommended to be set via environment variable"
 
+__HEDGE_SCHEMA = {
+    "description": "Hedge an OKX position on a strategy or manual request and hold both legs.",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "enabled": {"type": "boolean", "default": False},
+        "order_type": {
+            "description": "Hedge entry type. Limit and chase wait without a timeout.",
+            "type": "string",
+            "enum": ["market", "limit", "chase"],
+            "default": "market",
+        },
+        "after_safety_order": {
+            "description": "Used only by strategies implementing the DCA hedge trigger.",
+            "default": "last",
+            "oneOf": [{"enum": ["last"]}, {"type": "integer", "minimum": 1, "maximum": 9}],
+        },
+    },
+}
+
 CONF_SCHEMA = {
     "type": "object",
     "properties": {
+        "hedge": __HEDGE_SCHEMA,
         "max_open_trades": {
             "description": "Maximum number of open trades. -1 for unlimited.",
             "type": ["integer", "number"],

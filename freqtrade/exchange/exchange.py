@@ -1189,9 +1189,12 @@ class Exchange:
         params: dict | None = None,
         stop_loss: bool = False,
         stop_price: float | None = None,
+        client_order_id: str | None = None,
     ) -> CcxtOrder:
         now = dt_now()
-        order_id = f"dry_run_{side}_{pair}_{uuid4()}"
+        order_id = (
+            f"dry_run_{client_order_id}" if client_order_id else f"dry_run_{side}_{pair}_{uuid4()}"
+        )
         # Rounding here must respect to contract sizes
         _amount = self._contracts_to_amount(
             pair, self.amount_to_precision(pair, self._amount_to_contracts(pair, amount))
@@ -1482,14 +1485,23 @@ class Exchange:
         time_in_force: str = "GTC",
         reduceOnly: bool = False,
         initial_order: bool = True,
+        client_order_id: str | None = None,
     ) -> CcxtOrder:
         if self._config["dry_run"]:
             dry_order = self.create_dry_run_order(
-                pair, ordertype, side, amount, self.price_to_precision(pair, rate), leverage
+                pair,
+                ordertype,
+                side,
+                amount,
+                self.price_to_precision(pair, rate),
+                leverage,
+                client_order_id=client_order_id,
             )
             return dry_order
 
         params = self._get_params(side, ordertype, leverage, reduceOnly, time_in_force)
+        if client_order_id:
+            params["clientOrderId"] = client_order_id
 
         try:
             # Set the precision for amount and price(rate) as accepted by the exchange
@@ -1547,6 +1559,17 @@ class Exchange:
             ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
+
+    def validate_hedge_mode(self) -> None:
+        raise OperationalException(f"DCA hedge mode is not implemented for {self.name}.")
+
+    def validate_hedge_market(self, pair: str) -> None:
+        raise OperationalException(f"DCA hedge markets are not implemented for {self.name}.")
+
+    def fetch_order_by_client_id(
+        self, client_order_id: str, pair: str, *, order_type: str = "market"
+    ) -> CcxtOrder | None:
+        raise OperationalException(f"Client-ID order recovery is not implemented for {self.name}.")
 
     def create_chase_order(
         self,
@@ -4215,6 +4238,8 @@ class Exchange:
             )
 
         liquidation_price = None
+        if self._config["dry_run"] and self._config.get("hedge", {}).get("enabled", False):
+            return None
         if self._config["dry_run"] or not self.exchange_has("fetchPositions"):
             dry_kwargs: dict[str, Any] = {}
             if self.get_option("cross_liquidation_price_fallback", False):
@@ -4232,8 +4257,21 @@ class Exchange:
             )
         else:
             positions = self.fetch_positions(pair)
-            if len(positions) > 0:
+            desired_side = "short" if is_short else "long"
+            pos = next(
+                (
+                    position
+                    for position in positions
+                    if {"buy": "long", "sell": "short"}.get(
+                        position.get("side"), position.get("side")
+                    )
+                    == desired_side
+                ),
+                None,
+            )
+            if pos is None and len(positions) == 1 and positions[0].get("side") is None:
                 pos = positions[0]
+            if pos is not None:
                 position_liquidation_price = pos["liquidationPrice"]
                 if position_liquidation_price is not None and self._is_valid_liquidation_price(
                     position_liquidation_price

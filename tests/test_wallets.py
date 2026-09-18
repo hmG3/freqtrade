@@ -339,7 +339,7 @@ def test_sync_wallet_futures_live(mocker, default_conf):
     assert len(freqtrade.wallets._positions) == 2
 
     assert "USDT" in freqtrade.wallets._wallets
-    assert "ETH/USDT:USDT" in freqtrade.wallets._positions
+    assert ("ETH/USDT:USDT", "short") in freqtrade.wallets._positions
     assert freqtrade.wallets._last_wallet_refresh is not None
     assert freqtrade.wallets.get_owned("ETH/USDT:USDT", "ETH") == 1000
     assert freqtrade.wallets.get_owned("SOL/USDT:USDT", "SOL") == 0
@@ -348,7 +348,7 @@ def test_sync_wallet_futures_live(mocker, default_conf):
     del mock_result[0]
     freqtrade.wallets.update()
     assert len(freqtrade.wallets._positions) == 1
-    assert "ETH/USDT:USDT" not in freqtrade.wallets._positions
+    assert ("ETH/USDT:USDT", "short") not in freqtrade.wallets._positions
 
 
 @pytest.mark.parametrize("includes_upnl", [True, False])
@@ -391,15 +391,73 @@ def test_sync_wallet_futures_live_unrealized_pnl(mocker, default_conf_usdt, incl
     wallets = freqtrade.wallets
 
     # Position uPnL is taken from the exchange, never from initialMargin/collateral.
-    assert wallets._positions["ETH/USDT:USDT"].unrealized_pnl == 30.0
-    assert wallets._positions["ADA/USDT:USDT"].unrealized_pnl == -12.5
-    assert wallets._positions["ETH/USDT:USDT"].collateral == 100.0
+    assert wallets._positions[("ETH/USDT:USDT", "long")].unrealized_pnl == 30.0
+    assert wallets._positions[("ADA/USDT:USDT", "short")].unrealized_pnl == -12.5
+    assert wallets._positions[("ETH/USDT:USDT", "long")].collateral == 100.0
 
     # 1017.5 is equity (wallet balance 1000 + 17.5 uPnL) - strip it only where it's there.
     assert wallets.get_total("USDT") == (1000.0 if includes_upnl else 1017.5)
     # free/used are untouched either way.
     assert wallets.get_free("USDT") == 850
     assert wallets.get_used("USDT") == 150
+
+
+def test_sync_wallet_futures_live_tracks_both_position_sides(mocker, default_conf_usdt):
+    default_conf_usdt["dry_run"] = False
+    default_conf_usdt["trading_mode"] = "futures"
+    default_conf_usdt["margin_mode"] = "isolated"
+    positions = [
+        {
+            "symbol": "ETH/USDT:USDT",
+            "initialMargin": 100.0,
+            "leverage": 2.0,
+            "contracts": 3.0,
+            "collateral": 100.0,
+            "side": "long",
+        },
+        {
+            "symbol": "ETH/USDT:USDT",
+            "initialMargin": 80.0,
+            "leverage": 2.0,
+            "contracts": -2.0,
+            "collateral": 0.0,
+            "side": "short",
+        },
+        {
+            "symbol": "SOL/USDT:USDT",
+            "initialMargin": 0.0,
+            "leverage": 2.0,
+            "contracts": 0.0,
+            "collateral": 50.0,
+            "side": "long",
+        },
+    ]
+    mocker.patch.multiple(
+        EXMS,
+        get_balances=MagicMock(return_value={"USDT": {"free": 820, "used": 180, "total": 1000}}),
+        fetch_positions=MagicMock(return_value=positions),
+    )
+
+    wallets = get_patched_freqtradebot(mocker, default_conf_usdt).wallets
+
+    assert wallets.get_owned("ETH/USDT:USDT", "ETH", "long") == 30.0
+    assert wallets.get_owned("ETH/USDT:USDT", "ETH", "short") == 20.0
+    assert len(wallets.get_all_positions()) == 2
+    with pytest.raises(DependencyException, match="multiple position sides"):
+        wallets.get_owned("ETH/USDT:USDT", "ETH")
+
+    positions[0]["leverage"] = None
+    positions[1]["leverage"] = None
+    mocker.patch(
+        "freqtrade.wallets.Trade.get_trades_proxy",
+        return_value=[
+            MagicMock(trade_direction="short", leverage=7.0),
+            MagicMock(trade_direction="long", leverage=3.0),
+        ],
+    )
+    wallets.update()
+    assert wallets._positions[("ETH/USDT:USDT", "long")].leverage == 3.0
+    assert wallets._positions[("ETH/USDT:USDT", "short")].leverage == 7.0
 
 
 def test_sync_wallet_futures_live_no_positions_unchanged(mocker, default_conf_usdt):
@@ -468,10 +526,10 @@ def test_sync_wallet_futures_dry(mocker, default_conf, fee):
     assert len(freqtrade.wallets._wallets) == 1
     assert len(freqtrade.wallets._positions) == 4
     positions = freqtrade.wallets.get_all_positions()
-    assert positions["ETH/BTC"].side == "short"
-    assert positions["ETC/BTC"].side == "long"
-    assert positions["XRP/BTC"].side == "long"
-    assert positions["LTC/BTC"].side == "short"
+    assert positions[("ETH/BTC", "short")].side == "short"
+    assert positions[("ETC/BTC", "long")].side == "long"
+    assert positions[("XRP/BTC", "long")].side == "long"
+    assert positions[("LTC/BTC", "short")].side == "short"
 
     assert (
         freqtrade.wallets.get_starting_balance()
@@ -481,6 +539,36 @@ def test_sync_wallet_futures_dry(mocker, default_conf, fee):
     free = freqtrade.wallets.get_free("BTC")
     used = freqtrade.wallets.get_used("BTC")
     assert free + used == total
+
+
+def test_sync_wallet_futures_dry_aggregates_same_side_and_keeps_opposite_side(
+    mocker, default_conf, fee
+):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = "futures"
+    default_conf["margin_mode"] = "isolated"
+    freqtrade = get_patched_freqtradebot(mocker, default_conf)
+    create_mock_trades(fee, is_short=None)
+    trades = Trade.get_open_trades()
+    trades[0].pair = "ETH/BTC"
+    trades[0].is_short = False
+    trades[0].amount = 2.0
+    trades[0].stake_amount = 20.0
+    trades[1].pair = "ETH/BTC"
+    trades[1].is_short = False
+    trades[1].amount = 3.0
+    trades[1].stake_amount = 30.0
+    trades[2].pair = "ETH/BTC"
+    trades[2].is_short = True
+    trades[2].amount = 4.0
+    trades[2].stake_amount = 40.0
+    Trade.session.commit()
+
+    freqtrade.wallets.update()
+
+    assert freqtrade.wallets.get_owned("ETH/BTC", "ETH", "long") == 5.0
+    assert freqtrade.wallets.get_owned("ETH/BTC", "ETH", "short") == 4.0
+    assert freqtrade.wallets._positions[("ETH/BTC", "long")].collateral == 50.0
 
 
 def test_check_exit_amount(mocker, default_conf, fee):
@@ -526,6 +614,26 @@ def test_check_exit_amount_futures(mocker, default_conf, fee):
     assert freqtrade.wallets.check_exit_amount(trade) is False
     assert total_mock.call_count == 0
     assert update_mock.call_count == 1
+
+
+def test_check_exit_amount_futures_selects_trade_direction(mocker, default_conf, fee):
+    default_conf["trading_mode"] = "futures"
+    default_conf["margin_mode"] = "isolated"
+    freqtrade = get_patched_freqtradebot(mocker, default_conf)
+    create_mock_trades(fee, is_short=None)
+    trade = Trade.session.scalars(select(Trade)).first()
+    trade.trading_mode = "futures"
+    trade.is_short = True
+    trade.amount = 4.0
+    freqtrade.wallets._positions = {
+        (trade.pair, "long"): PositionWallet(trade.pair, position=100.0, side="long"),
+        (trade.pair, "short"): PositionWallet(trade.pair, position=3.0, side="short"),
+    }
+    mocker.patch("freqtrade.wallets.Wallets.update")
+
+    assert freqtrade.wallets.check_exit_amount(trade) is False
+    trade.is_short = False
+    assert freqtrade.wallets.check_exit_amount(trade) is True
 
 
 @pytest.mark.parametrize(
@@ -662,8 +770,8 @@ def test_dry_run_wallet_initialization(mocker, default_conf_usdt, config, wallet
     else:
         # Futures mode
         assert "NEO" not in freqtrade.wallets._wallets
-        assert freqtrade.wallets._positions["NEO/USDT"].position == 45.04504504
-        assert pytest.approx(freqtrade.wallets._positions["NEO/USDT"].collateral) == 100
+        assert freqtrade.wallets._positions[("NEO/USDT", "long")].position == 45.04504504
+        assert pytest.approx(freqtrade.wallets._positions[("NEO/USDT", "long")].collateral) == 100
 
         # Verify USDT wallet's free was reduced by trade amount
         assert (
@@ -685,7 +793,7 @@ def test_record_wallet_state_stores_wallet_history(mocker, default_conf_usdt):
         "BTC": Wallet("BTC", free=2.0, used=1.0, total=3.0),
     }
     freqtrade.wallets._positions = {
-        "ETH/USDT:USDT": PositionWallet(
+        ("ETH/USDT:USDT", "long"): PositionWallet(
             symbol="ETH/USDT:USDT",
             position=0.8,
             collateral=1.0,
@@ -734,7 +842,7 @@ def test_record_wallet_state_stores_wallet_history_error(mocker, default_conf, c
         "ETH": Wallet("ETH", free=2.0, used=1.0, total=3.0),
     }
     freqtrade.wallets._positions = {
-        "ETH/BTC": PositionWallet(
+        ("ETH/BTC", "long"): PositionWallet(
             symbol="ETH/BTC",
             position=0.8,
             collateral=1.0,

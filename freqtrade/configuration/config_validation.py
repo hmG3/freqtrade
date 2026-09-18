@@ -93,10 +93,20 @@ def validate_config_consistency(conf: dict[str, Any], *, preliminary: bool = Fal
     validate_migrated_strategy_settings(conf)
     _validate_orderflow(conf)
     _validate_demo_trading(conf)
+    _validate_hedge(conf)
 
     # validate configuration before returning
     logger.info("Validating configuration ...")
     validate_config_schema(conf, preliminary=preliminary)
+
+
+def _validate_hedge(conf: dict[str, Any]) -> None:
+    if not conf.get("hedge", {}).get("enabled", False):
+        return
+    if conf.get("exchange", {}).get("name") != "okx" or conf.get("trading_mode") != "futures":
+        raise ConfigurationError("hedge requires OKX futures.")
+    if conf.get("runmode") not in (RunMode.LIVE, RunMode.DRY_RUN):
+        raise ConfigurationError("hedge supports live/dry-run only, not backtest or hyperopt.")
 
 
 def _validate_unlimited_amount(conf: dict[str, Any]) -> None:

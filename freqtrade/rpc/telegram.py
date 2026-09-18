@@ -271,6 +271,7 @@ class Telegram(RPCHandler):
             CommandHandler("start", self._start),
             CommandHandler("stop", self._stop),
             CommandHandler(["forcesell", "forceexit", "fx"], self._force_exit),
+            CommandHandler("hedge", self._hedge),
             CommandHandler(
                 ["forcebuy", "forcelong"],
                 partial(self._force_enter, order_side=SignalDirection.LONG),
@@ -1402,6 +1403,27 @@ class Telegram(RPCHandler):
         await self._send_msg(f"Status: `{msg['status']}`")
 
     @authorized_only
+    async def _hedge(self, update: Update, context: CallbackContext) -> None:
+        """Handler for /hedge <trade_id>. Use the shared controller in an executor."""
+        if (
+            not context.args
+            or len(context.args) != 1
+            or not context.args[0].isdecimal()
+            or int(context.args[0]) <= 0
+        ):
+            message = "Usage: /hedge <trade_id> (one positive trade ID)."
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, safe_async_db(self._rpc._rpc_hedge), context.args[0]
+                )
+                message = result["result"]
+            except RPCException as exc:
+                message = str(exc)
+        await self._send_msg(escape(message), parse_mode=ParseMode.HTML)
+
+    @authorized_only
     async def _force_exit(self, update: Update, context: CallbackContext) -> None:
         """
         Handler for /forceexit <id>.
@@ -1934,6 +1956,8 @@ class Telegram(RPCHandler):
             "*/forceexit <trade_id>|all:* `Instantly exits the given trade or all trades, "
             "regardless of profit`\n"
             "*/fx <trade_id>|all:* `Alias to /forceexit`\n"
+            "*/hedge <trade_id>:* `Hedge the full position and hold both legs for manual closure. "
+            "Requires hedge enabled.`\n"
             f"{force_enter_text if self._config.get('force_entry_enable', False) else ''}"
             "*/delete <trade_id>:* `Instantly delete the given trade in the database`\n"
             "*/reload_trade <trade_id>:* `Reload trade from exchange Orders`\n"

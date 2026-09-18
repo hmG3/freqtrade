@@ -165,7 +165,7 @@ def test_telegram_init(default_conf, mocker, caplog) -> None:
     message_str = (
         "rpc.telegram is listening for following commands: [['status'], ['profit'], "
         "['balance'], ['start'], ['stop'], "
-        "['forceexit', 'forcesell', 'fx'], ['forcebuy', 'forcelong'], ['forceshort'], "
+        "['forceexit', 'forcesell', 'fx'], ['hedge'], ['forcebuy', 'forcelong'], ['forceshort'], "
         "['reload_trade'], ['trades'], ['delete'], ['cancel_open_order', 'coo'], "
         "['performance'], ['buys', 'entries'], ['exits', 'sells'], ['mix_tags'], "
         "['stats'], ['daily'], ['weekly'], ['monthly'], "
@@ -1568,6 +1568,51 @@ async def test_forceexit_handle_invalid(default_conf, update, mocker) -> None:
     await telegram._force_exit(update=update, context=context)
     assert msg_mock.call_count == 1
     assert "invalid argument" in msg_mock.call_args_list[0][0][0]
+
+
+async def test_hedge_command(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    request = mocker.patch.object(
+        telegram._rpc, "_rpc_hedge", return_value={"result": "Hedge for trade 42: opening."}
+    )
+    await telegram._hedge(update, MagicMock(args=["42"]))
+    request.assert_called_once_with("42")
+    assert "Hedge for trade 42: opening." in msg_mock.call_args.args[0]
+
+
+@pytest.mark.parametrize("args", [[], ["all"], ["abc"], ["-1"], ["0"], ["42", "market"]])
+async def test_hedge_command_usage(default_conf, update, mocker, args):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    request = mocker.patch.object(telegram._rpc, "_rpc_hedge")
+    await telegram._hedge(update, MagicMock(args=args))
+    request.assert_not_called()
+    assert "/hedge &lt;trade_id&gt;" in msg_mock.call_args.args[0]
+    assert msg_mock.call_args.kwargs["parse_mode"] == "HTML"
+
+
+async def test_hedge_command_reports_error(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    mocker.patch.object(
+        telegram._rpc, "_rpc_hedge", side_effect=RPCException("hedge: balance < margin")
+    )
+    await telegram._hedge(update, MagicMock(args=["42"]))
+    assert "hedge: balance &lt; margin" in msg_mock.call_args.args[0]
+    assert msg_mock.call_args.kwargs["parse_mode"] == "HTML"
+
+
+@pytest.mark.parametrize("restriction", ["chat", "topic", "user"])
+async def test_hedge_command_rejects_unauthorized_access(default_conf, update, mocker, restriction):
+    if restriction == "chat":
+        default_conf["telegram"]["chat_id"] = "99999"
+    elif restriction == "topic":
+        default_conf["telegram"]["topic_id"] = "99"
+    else:
+        default_conf["telegram"]["authorized_users"] = ["99999"]
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    request = mocker.patch.object(telegram._rpc, "_rpc_hedge")
+    await telegram._hedge(update, MagicMock(args=["42"]))
+    request.assert_not_called()
+    msg_mock.assert_not_called()
 
 
 async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> None:

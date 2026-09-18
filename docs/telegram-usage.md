@@ -222,6 +222,7 @@ official commands. You can ask at any moment for help with `/help`.
 | `/forceexit <trade_id> | /fx <tradeid>` | Instantly exits the given trade  (Ignoring `minimum_roi`).
 | `/forceexit all | /fx all` | Instantly exits all open trades (Ignoring `minimum_roi`).
 | `/fx` | alias for `/forceexit`
+| `/hedge <trade_id>` | Open a full opposite OKX hedge and hold both legs for manual closure. Requires `hedge.enabled`. See [hedge commands](okx-dca-hedge.md#open-a-hedge-manually-with-telegram).
 | `/forcelong <pair> [rate]` | Instantly buys the given pair. Rate is optional and only applies to limit orders. (`force_entry_enable` must be set to True)
 | `/forceshort <pair> [rate]` | Instantly shorts the given pair. Rate is optional and only applies to limit orders. This will only work on non-spot markets. (`force_entry_enable` must be set to True)
 | `/delete <trade_id>` | Delete a specific trade from the Database. Tries to close open orders. Requires manual handling of this trade on the exchange.

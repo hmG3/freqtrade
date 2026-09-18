@@ -36,6 +36,7 @@ nav:
     - Utility Sub-commands: utils.md
     - Plotting: plotting.md
     - Exchange-specific Notes: exchanges.md
+    - OKX Strategy Hedging: okx-dca-hedge.md
     - Data Analysis:
         - Jupyter Notebooks: data-analysis.md
         - Strategy analysis: strategy_analysis_example.md

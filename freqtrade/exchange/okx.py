@@ -110,11 +110,80 @@ class Okx(Exchange):
                     )
                 if account_info:
                     self.net_only = account_info.get("posMode") == "net_mode"
+                if self._config.get("hedge", {}).get("enabled", False):
+                    if account_info.get("posMode") != "long_short_mode":
+                        raise OperationalException(
+                            "OKX hedging requires the account to use long_short_mode."
+                        )
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
             raise TemporaryError(
                 f"Error in additional_exchange_init due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def validate_hedge_mode(self) -> None:
+        if self.trading_mode != TradingMode.FUTURES or self.margin_mode not in (
+            MarginMode.CROSS,
+            MarginMode.ISOLATED,
+        ):
+            raise OperationalException("OKX hedging requires cross or isolated futures.")
+        if self._config["dry_run"]:
+            self.net_only = False
+        elif self.net_only:
+            raise OperationalException("OKX hedging requires long_short_mode.")
+
+    def validate_hedge_market(self, pair: str) -> None:
+        market = self.markets.get(pair)
+        if not market or not self.market_is_future(market):
+            raise OperationalException(f"OKX hedging requires a linear swap for {pair}.")
+        if market.get("settle") != self._config["stake_currency"]:
+            raise OperationalException(
+                f"OKX hedge settlement for {pair} must match stake currency "
+                f"{self._config['stake_currency']}."
+            )
+
+    def fetch_order_by_client_id(
+        self, client_order_id: str, pair: str, *, order_type: str = "market"
+    ) -> CcxtOrder | None:
+        if self._config["dry_run"]:
+            try:
+                return self.fetch_dry_run_order(f"dry_run_{client_order_id}")
+            except InvalidOrderException:
+                return None
+        if order_type != "chase":
+            try:
+                return self.fetch_order(
+                    client_order_id, pair, params={"clientOrderId": client_order_id}
+                )
+            except RetryableOrderError:
+                return None
+        try:
+            response = self._api.private_get_trade_order_algo({"algoClOrdId": client_order_id})
+            self._log_exchange_response("fetch_chase_order_by_client_id", response)
+            item = self._get_chase_response_item(response)
+            if (
+                item.get("instId") != self.markets[pair]["id"]
+                or item.get("algoClOrdId") != client_order_id
+                or item.get("ordType", "chase") != "chase"
+            ):
+                raise OperationalException("Recovered chase order does not match hedge intent.")
+            child_orders = self._fetch_chase_child_orders(pair, item)
+            return self._normalize_chase_order(pair, item, child_orders)
+        except ccxt.OrderNotFound:
+            return None
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(
+                f"Tried to get an invalid order by client id "
+                f"(pair: {pair} id: {client_order_id}). Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get order by client id due to {e.__class__.__name__}. Message: {e}"
             ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
@@ -185,6 +254,8 @@ class Okx(Exchange):
         }
         if params.get("reduceOnly"):
             request["reduceOnly"] = True
+        if params.get("clientOrderId"):
+            request["algoClOrdId"] = params["clientOrderId"]
 
         response = self._api.private_post_trade_order_algo(request)
         self._log_exchange_response("create_chase_order", response)
@@ -492,6 +563,8 @@ class Okx(Exchange):
             order["id_chase_list"] = child_ids
         if item.get("cTime"):
             order["timestamp"] = int(item["cTime"])
+        if item.get("algoClOrdId"):
+            order["clientOrderId"] = item["algoClOrdId"]
         return self._order_contracts_to_amount(order)
 
     @retrier(retries=API_RETRY_COUNT)

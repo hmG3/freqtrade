@@ -346,6 +346,242 @@ def test_additional_exchange_init_okx_cross_rejects_account_level(default_conf, 
         exchange.additional_exchange_init()
 
 
+def test_okx_hedge_mode_requires_long_short_account(default_conf, mocker):
+    api_mock = MagicMock()
+    api_mock.fetch_accounts.return_value = [{"info": {"acctLv": "2", "posMode": "net_mode"}}]
+    default_conf.update(
+        {
+            "dry_run": False,
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
+            "hedge": {"enabled": True},
+        }
+    )
+    with pytest.raises(OperationalException, match="long_short_mode"):
+        get_patched_exchange(mocker, default_conf, exchange="okx", api_mock=api_mock)
+
+
+def test_okx_hedge_mode_dry_run_uses_both_sides(default_conf, mocker):
+    default_conf.update(
+        {
+            "dry_run": True,
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
+            "hedge": {"enabled": True},
+        }
+    )
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+
+    exchange.validate_hedge_mode()
+
+    assert exchange.net_only is False
+
+
+def test_okx_validate_hedge_market(default_conf, mocker, markets):
+    default_conf.update(
+        {"trading_mode": "futures", "margin_mode": "isolated", "stake_currency": "USDT"}
+    )
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    pair = "ETH/USDT:USDT"
+    exchange.markets[pair] = {**markets[pair], "linear": True, "settle": "USDT"}
+
+    exchange.validate_hedge_market(pair)
+    exchange.markets[pair]["linear"] = False
+    with pytest.raises(OperationalException, match="linear"):
+        exchange.validate_hedge_market(pair)
+    exchange.markets[pair]["linear"] = True
+    exchange.markets[pair]["settle"] = "BTC"
+    with pytest.raises(OperationalException, match="settlement"):
+        exchange.validate_hedge_market(pair)
+
+
+def test_okx_create_and_fetch_order_by_client_id_dry_run(
+    default_conf, mocker, markets, init_persistence
+):
+    default_conf.update({"dry_run": True, "trading_mode": "futures", "margin_mode": "isolated"})
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    pair = "ETH/USDT:USDT"
+    exchange.markets[pair] = markets[pair]
+    mocker.patch.object(exchange, "exchange_has", return_value=False)
+
+    order = exchange.create_order(
+        pair=pair,
+        ordertype="limit",
+        side="buy",
+        amount=1.0,
+        rate=100.0,
+        leverage=1.0,
+        client_order_id="hedge-123",
+    )
+
+    assert order["id"] == "dry_run_hedge-123"
+    assert exchange.fetch_order_by_client_id("hedge-123", pair) == order
+    assert exchange.fetch_order_by_client_id("missing", pair) is None
+
+
+def test_okx_hedge_market_rejects_dated_contracts(default_conf, mocker, markets):
+    default_conf.update({"trading_mode": "futures", "stake_currency": "USDT"})
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    pair = "ETH/USDT:USDT"
+    exchange.markets[pair] = {
+        **markets[pair],
+        "contract": True,
+        "linear": True,
+        "settle": "USDT",
+        "type": "future",
+        "swap": False,
+    }
+    with pytest.raises(OperationalException, match="linear swap"):
+        exchange.validate_hedge_market(pair)
+
+
+def test_okx_client_id_lookup_restores_persisted_dry_order_and_updates_fill(
+    default_conf,
+    mocker,
+    init_persistence,
+):
+    from freqtrade.persistence import Order, Trade
+
+    default_conf["dry_run"] = True
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    pair = "ETH/USDT:USDT"
+    order = {
+        "id": "dry_run_recovery",
+        "symbol": pair,
+        "status": "open",
+        "type": "limit",
+        "side": "buy",
+        "price": 80.0,
+        "average": None,
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "cost": 0.0,
+    }
+    stored = Order.parse_from_ccxt_object(order, pair, "buy")
+    trade = Trade(
+        pair=pair,
+        exchange="okx",
+        open_rate=80,
+        amount=0,
+        stake_amount=80,
+        fee_open=0.001,
+        fee_close=0.001,
+        orders=[stored],
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+    fill = mocker.patch.object(
+        exchange,
+        "check_dry_limit_order_filled",
+        side_effect=lambda snapshot: snapshot | {"status": "closed", "filled": 1.0, "remaining": 0},
+    )
+    result = exchange.fetch_order_by_client_id("recovery", pair)
+    assert result is not None and result["status"] == "closed" and result["filled"] == 1.0
+    assert result["id"] == order["id"]
+    assert fill.call_count == 1
+
+
+def test_okx_fetch_order_by_client_id_live(default_conf, mocker):
+    api_mock = MagicMock()
+    api_mock.fetch_order.return_value = {
+        "id": "exchange-id",
+        "symbol": "ETH/USDT:USDT",
+        "amount": 2.0,
+        "filled": 1.0,
+        "remaining": 1.0,
+        "status": "open",
+    }
+    default_conf["dry_run"] = False
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx", api_mock=api_mock)
+    mocker.patch.object(exchange, "_order_contracts_to_amount", side_effect=lambda order: order)
+    mocker.patch.object(exchange, "exchange_has", return_value=True)
+
+    result = exchange.fetch_order_by_client_id("hedge-123", "ETH/USDT:USDT")
+
+    assert result == api_mock.fetch_order.return_value
+    api_mock.fetch_order.assert_called_once_with(
+        "hedge-123", "ETH/USDT:USDT", params={"clientOrderId": "hedge-123"}
+    )
+
+    api_mock.fetch_order.side_effect = ccxt.OrderNotFound("missing")
+    assert exchange.fetch_order_by_client_id("missing", "ETH/USDT:USDT") is None
+
+
+def test_create_order_passes_client_order_id(default_conf, mocker):
+    api_mock = MagicMock()
+    api_mock.create_order.return_value = {
+        "id": "exchange-id",
+        "symbol": "ETH/USDT:USDT",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "status": "open",
+    }
+    default_conf["dry_run"] = False
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx", api_mock=api_mock)
+    mocker.patch.object(exchange, "_order_contracts_to_amount", side_effect=lambda order: order)
+    mocker.patch.object(exchange, "_lev_prep")
+
+    exchange.create_order(
+        pair="ETH/USDT:USDT",
+        ordertype="limit",
+        side="buy",
+        amount=1.0,
+        rate=100.0,
+        leverage=1.0,
+        client_order_id="hedge-123",
+    )
+
+    assert api_mock.create_order.call_args.args[-1]["clientOrderId"] == "hedge-123"
+
+
+def test_okx_liquidation_price_selects_requested_side(default_conf, mocker):
+    default_conf.update({"dry_run": False, "trading_mode": "futures", "margin_mode": "isolated"})
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.ISOLATED
+    exchange._config["dry_run"] = False
+    mocker.patch.object(exchange, "exchange_has", return_value=True)
+    mocker.patch.object(
+        exchange,
+        "fetch_positions",
+        return_value=[
+            {"side": "short", "liquidationPrice": 150.0},
+            {"side": "long", "liquidationPrice": 50.0},
+        ],
+    )
+    exchange.liquidation_buffer = 0.0
+
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, False, 1, 100, 1, 100) == 50
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, True, 1, 100, 1, 100) == 150
+
+
+def test_okx_liquidation_price_side_alias_and_legacy_missing_side(default_conf, mocker):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.ISOLATED
+    exchange._config["dry_run"] = False
+    mocker.patch.object(exchange, "exchange_has", return_value=True)
+    positions = [{"side": "buy", "liquidationPrice": 45.0}]
+    mocker.patch.object(exchange, "fetch_positions", side_effect=lambda pair: positions)
+    exchange.liquidation_buffer = 0.0
+
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, False, 1, 100, 1, 100) == 45
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, True, 1, 100, 1, 100) is None
+    positions[:] = [{"side": None, "liquidationPrice": 55.0}]
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, False, 1, 100, 1, 100) == 55
+
+
+def test_okx_dry_run_hedge_liquidation_is_not_modeled(default_conf, mocker):
+    default_conf["hedge"] = {"enabled": True}
+    exchange = get_patched_exchange(mocker, default_conf, exchange="okx")
+    exchange.trading_mode = TradingMode.FUTURES
+    exchange.margin_mode = MarginMode.CROSS
+
+    assert exchange.get_liquidation_price("ETH/USDT:USDT", 100, False, 1, 100, 1, 100) is None
+
+
 def test_load_leverage_tiers_okx(default_conf, mocker, markets, tmp_path, caplog, time_machine):
     default_conf["datadir"] = tmp_path
     # fd_mock = mocker.patch('freqtrade.exchange.exchange.file_dump_json')
@@ -822,8 +1058,17 @@ def test_fetch_orders_okx(default_conf, mocker, limit_order):
     ],
 )
 @pytest.mark.parametrize("margin_mode", [MarginMode.ISOLATED, MarginMode.CROSS])
+@pytest.mark.parametrize("client_id", [None, "fthChaseHedge123"])
 def test_create_chase_order_okx(
-    default_conf, mocker, markets, net_only, side, reduce_only, position_side, margin_mode
+    default_conf,
+    mocker,
+    markets,
+    net_only,
+    side,
+    reduce_only,
+    position_side,
+    margin_mode,
+    client_id,
 ):
     default_conf["dry_run"] = True
     default_conf["trading_mode"] = TradingMode.FUTURES
@@ -854,6 +1099,7 @@ def test_create_chase_order_okx(
         rate=2500.0,
         leverage=3.0,
         reduceOnly=reduce_only,
+        client_order_id=client_id,
     )
 
     expected_request = {
@@ -868,6 +1114,8 @@ def test_create_chase_order_okx(
     }
     if reduce_only:
         expected_request["reduceOnly"] = True
+    if client_id:
+        expected_request["algoClOrdId"] = client_id
     api_mock.private_post_trade_order_algo.assert_called_once_with(expected_request)
     assert order == {
         "id": "12345",
@@ -886,7 +1134,10 @@ def test_create_chase_order_okx(
     }
 
 
-def test_fetch_chase_order_okx_normalizes_parent_and_child(default_conf, mocker, markets):
+@pytest.mark.parametrize("by_client_id", [False, True])
+def test_fetch_chase_order_okx_normalizes_parent_and_child(
+    default_conf, mocker, markets, by_client_id
+):
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
     default_conf["margin_mode"] = MarginMode.ISOLATED
@@ -897,6 +1148,7 @@ def test_fetch_chase_order_okx_normalizes_parent_and_child(default_conf, mocker,
         "data": [
             {
                 "algoId": "12345",
+                "algoClOrdId": "fthChaseHedge123",
                 "ordId": "67890",
                 "instId": "ETH-USDT-SWAP",
                 "state": "effective",
@@ -933,9 +1185,17 @@ def test_fetch_chase_order_okx_normalizes_parent_and_child(default_conf, mocker,
         mock_markets={"ETH/USDT:USDT": market},
     )
 
-    order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
+    if by_client_id:
+        order = exchange.fetch_order_by_client_id(
+            "fthChaseHedge123", "ETH/USDT:USDT", order_type="chase"
+        )
+    else:
+        order = exchange.fetch_chase_order("12345", "ETH/USDT:USDT")
 
-    api_mock.private_get_trade_order_algo.assert_called_once_with({"algoId": "12345"})
+    api_mock.private_get_trade_order_algo.assert_called_once_with(
+        {"algoClOrdId": "fthChaseHedge123"} if by_client_id else {"algoId": "12345"}
+    )
+    assert order["clientOrderId"] == "fthChaseHedge123"
     assert order["id"] == "12345"
     assert order["id_chase"] == "67890"
     assert order["type"] == "chase"

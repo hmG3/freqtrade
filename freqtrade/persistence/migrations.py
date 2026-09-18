@@ -9,6 +9,11 @@ from freqtrade.persistence.trade_model import Order, Trade
 logger = logging.getLogger(__name__)
 
 
+def migrate_hedge_groups(engine: Engine, decl_base) -> None:
+    """First release: create the complete hedge schema in one idempotent step."""
+    decl_base.metadata.tables["hedge_groups"].create(engine, checkfirst=True)
+
+
 def get_table_names_for_table(inspector, tabletype: str) -> list[str]:
     return [t for t in inspector.get_table_names() if t.startswith(tabletype)]
 
@@ -440,6 +445,7 @@ def check_migrate(engine: Engine, decl_base, previous_tables: list[str]) -> None
             f"Running database migration for trades - "
             f"backup: {table_back_name}, {order_table_bak_name}"
         )
+
         migrate_trades_and_orders_table(
             decl_base,
             inspector,
@@ -474,6 +480,7 @@ def check_migrate(engine: Engine, decl_base, previous_tables: list[str]) -> None
             "start with a fresh database."
         )
 
+    migrate_hedge_groups(engine, decl_base)
     set_sqlite_to_wal(engine)
     fix_old_dry_orders(engine)
     fix_wrong_max_stake_amount(engine)

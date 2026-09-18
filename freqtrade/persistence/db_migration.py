@@ -5,6 +5,7 @@ from sqlalchemy.orm import make_transient
 
 from freqtrade.persistence.base import SessionType
 from freqtrade.persistence.custom_data import _CustomData
+from freqtrade.persistence.hedge_group import HedgeGroup
 from freqtrade.persistence.key_value_store import _KeyValueStoreModel
 from freqtrade.persistence.migrations import set_sequence_ids
 from freqtrade.persistence.pairlock import PairLock
@@ -22,6 +23,7 @@ def migrate_db(session_target: SessionType):
     kv_count = 0
     custom_data_count = 0
     wallet_history_count = 0
+    hedge_group_count = 0
     for trade in Trade.get_trades():
         trade_count += 1
         make_transient(trade)
@@ -30,6 +32,12 @@ def migrate_db(session_target: SessionType):
 
         session_target.add(trade)
 
+    session_target.commit()
+
+    for hedge_group in HedgeGroup.session.scalars(select(HedgeGroup)):
+        hedge_group_count += 1
+        make_transient(hedge_group)
+        session_target.add(hedge_group)
     session_target.commit()
 
     for pairlock in PairLock.get_all_locks():
@@ -77,5 +85,5 @@ def migrate_db(session_target: SessionType):
     logger.info(
         f"Migrated {trade_count} Trades, {pairlock_count} Pairlocks, "
         f"{kv_count} Key-Value pairs, {custom_data_count} Custom Data entries, "
-        f"and {wallet_history_count} Wallet History entries."
+        f"{wallet_history_count} Wallet History entries, and {hedge_group_count} Hedge Groups."
     )
