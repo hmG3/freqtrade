@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from freqtrade.exchange import amount_to_contract_precision
 from freqtrade.persistence import Order, Trade
 from freqtrade.persistence.custom_data import CustomDataWrapper
 from freqtrade.resolvers import StrategyResolver
+from freqtrade.resolvers.iresolver import PathModifier
 from freqtrade.util import FtPrecise
 from user_data.strategies.market_structure_trend_matrix_strategy import (
     MarketStructureTrendMatrixStrategy,
@@ -25,7 +27,11 @@ def custom_data(monkeypatch):
 
 
 def strategy(**parameters):
-    result = MarketStructureTrendMatrixStrategy({"stake_currency": "USDT"})
+    with PathModifier(Path(__file__).parents[2] / "user_data/strategies"):
+        futures_class = import_module(
+            "Fmarket_structure_trend_matrix_strategy"
+        ).FMarketStructureTrendMatrixStrategy
+    result = futures_class({"stake_currency": "USDT"})
     settings = {
         "ms_length": 10,
         "atr_length": 14,
@@ -142,6 +148,25 @@ def test_entries_trade_both_sides_only_on_valid_structure_changes():
     assert result["exit_short"].tolist() == [1, 0, 0, 1, 0]
 
 
+def test_plain_strategy_is_spot_and_emits_no_short_signals():
+    s = MarketStructureTrendMatrixStrategy({"stake_currency": "USDT"})
+    data = DataFrame(
+        {
+            "choch": [1, -1],
+            "volume": [1, 1],
+            "atr": [2, 2],
+            "atr_stop": [90, 110],
+            "initial_target": [104, 96],
+        }
+    )
+    result = s.populate_exit_trend(s.populate_entry_trend(data, {}), {})
+    assert not s.can_short
+    assert result["enter_long"].tolist() == [1, 0]
+    assert result["enter_short"].tolist() == [0, 0]
+    assert result["exit_long"].tolist() == [0, 1]
+    assert result["exit_short"].tolist() == [0, 0]
+
+
 def filled_order(trade, side, tag, amount, number=0, status="closed", when=None):
     order = Order.parse_from_ccxt_object(
         {
@@ -175,6 +200,8 @@ def trade_context(is_short=False, count=3, leverage=1.0, initial_amount=1.0, ope
             "direction": [-1 if is_short else 1] * 2,
             "atr_stop": [110.0, 108.0] if is_short else [90.0, 92.0],
             "initial_target": [96.0, 96.0] if is_short else [104.0, 104.0],
+            "high": [102.0, 102.0],
+            "low": [98.0, 98.0],
         }
     )
     s.dp = SimpleNamespace(get_analyzed_dataframe=lambda pair, timeframe: (data, None))
@@ -256,6 +283,19 @@ def test_missing_stop_or_invalid_price_does_not_request_hedge():
 
 
 @pytest.mark.parametrize("is_short", [False, True])
+@pytest.mark.parametrize(("wick_offset", "target_offset"), [(8.0, 12.0), (9.0, 12.0)])
+def test_signal_wick_passes_targets_before_position_opens(is_short, wick_offset, target_offset):
+    direction = -1 if is_short else 1
+    s, t, data = trade_context(is_short)
+    CustomDataWrapper.reset_custom_data()
+    data.loc[0, "low" if is_short else "high"] = 100.0 + direction * wick_offset
+    s.order_filled(t.pair, t, t.orders[0], t.open_date_utc)
+    target = 100.0 + direction * target_offset
+    assert adjust(s, t, target - direction * 0.01) is None
+    assert adjust(s, t, target) == (-t.stake_amount / 4, "mstm_tp_1")
+
+
+@pytest.mark.parametrize("is_short", [False, True])
 @pytest.mark.parametrize(
     ("entry_offset", "target_offset"),
     [(3.99, 4.0), (4.0, 8.0), (7.5, 8.0), (8.0, 12.0), (13.0, 16.0)],
@@ -308,6 +348,8 @@ def test_first_target_respects_fractional_price_boundaries(is_short, open_rate, 
     data["initial_target"] = 10.1
     data["atr"] = 0.0005  # Target spacing is 0.001.
     data["atr_stop"] = 11.0 if is_short else 9.0
+    data["high"] = 10.101
+    data["low"] = 10.099
     s.order_filled(t.pair, t, t.orders[0], t.open_date_utc)
     direction = -1 if is_short else 1
     assert adjust(s, t, target - direction * 0.00001) is None
@@ -341,13 +383,15 @@ def test_equal_targets_leave_one_equal_runner_and_advance_using_fill_atr(
         target += direction * 6  # confirmed ATR 3 * step 2
         assert adjust(s, t, target, now) is None  # only one target per candle
         now += timedelta(minutes=15)
-        data.loc[len(data)] = [
-            now - timedelta(minutes=15),
-            3.0,
-            direction,
-            108.0 if is_short else 92.0,
-            96.0 if is_short else 104.0,
-        ]
+        data.loc[len(data)] = {
+            "date": now - timedelta(minutes=15),
+            "atr": 3.0,
+            "direction": direction,
+            "atr_stop": 108.0 if is_short else 92.0,
+            "initial_target": 96.0 if is_short else 104.0,
+            "high": 102.0,
+            "low": 98.0,
+        }
         # New strategy instance still uses the persisted trade plan.
         replacement = strategy(target_count=2, target_step_multiplier=9.0)
         replacement.dp = s.dp
@@ -453,13 +497,15 @@ def test_stop_uses_closed_candles_leverage_and_never_widens_after_fill(is_short)
     data.loc[1, "atr_stop"] = 115 if is_short else 85
     assert s.custom_stoploss(t.pair, t, now, rate, 0.1, after_fill=True) == actual
     # A not-yet-closed candle must not tighten the stop early.
-    data.loc[2] = [
-        now,
-        3.0,
-        -1 if is_short else 1,
-        96 if is_short else 104,
-        96 if is_short else 104,
-    ]
+    data.loc[2] = {
+        "date": now,
+        "atr": 3.0,
+        "direction": -1 if is_short else 1,
+        "atr_stop": 96 if is_short else 104,
+        "initial_target": 96 if is_short else 104,
+        "high": 102.0,
+        "low": 98.0,
+    }
     assert s.custom_stoploss(t.pair, t, now, rate, 0.1, after_fill=False) == actual
 
 
@@ -662,21 +708,33 @@ def test_freqtrade_installs_absolute_atr_stop_on_entry_and_partial_fill(is_short
     assert t.stop_loss == pytest.approx(108 if is_short else 92)
 
 
-def test_freqtrade_resolver_loads_futures_strategy(default_conf):
+@pytest.mark.parametrize(
+    ("strategy_name", "trading_mode", "can_short"),
+    [
+        ("MarketStructureTrendMatrixStrategy", "spot", False),
+        ("FMarketStructureTrendMatrixStrategy", "futures", True),
+    ],
+)
+def test_freqtrade_resolver_loads_spot_and_futures_strategy(
+    default_conf, strategy_name, trading_mode, can_short
+):
     for override in ("minimal_roi", "timeframe", "stoploss"):
         default_conf.pop(override, None)
     default_conf.update(
         {
-            "strategy": "MarketStructureTrendMatrixStrategy",
+            "strategy": strategy_name,
             "strategy_path": str(Path(__file__).parents[2] / "user_data/strategies"),
-            "trading_mode": "futures",
-            "margin_mode": "isolated",
+            "trading_mode": trading_mode,
         }
     )
+    if trading_mode == "futures":
+        default_conf["margin_mode"] = "isolated"
+    else:
+        default_conf.pop("margin_mode", None)
     loaded = StrategyResolver.load_strategy(default_conf)
     frame = loaded.advise_indicators(candles([10.0] * 600), {"pair": "ETH/USDT:USDT"})
     result = loaded.ft_advise_signals(frame, {"pair": "ETH/USDT:USDT"})
-    assert loaded.can_short
+    assert loaded.can_short == can_short
     assert len(result) == 600
     assert (result["enter_long"] == 0).all()
     assert (result["enter_short"] == 0).all()
