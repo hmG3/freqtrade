@@ -12,9 +12,6 @@ from freqtrade.persistence.hedge_group import HedgeGroup
 from tests.conftest import patch_exchange, patch_freqtradebot
 from tests.test_dca_hedge import ccxt_order
 from user_data.strategies.adx_vw_dca_strategy import ADXVWDCAStrategy
-from user_data.strategies.market_structure_trend_matrix_strategy import (
-    MarketStructureTrendMatrixStrategy,
-)
 from user_data.strategies.qfl_dca_strategy import QFLDCAStrategy
 from user_data.strategies.rsi_ml_dca_strategy import RSIMLDCAStrategy
 from user_data.strategies.rtb_dca_strategy import RTBDCAStrategy
@@ -42,15 +39,17 @@ def test_hedge_order_type_schema_rejects_unsupported_types(order_type):
         validate({"enabled": True, "order_type": order_type}, CONF_SCHEMA["properties"]["hedge"])
 
 
-@pytest.mark.parametrize("strategy_class", [*STRATEGIES, MarketStructureTrendMatrixStrategy])
+@pytest.mark.parametrize(
+    "strategy_name", [s.__name__ for s in STRATEGIES] + ["FMarketStructureTrendMatrixStrategy"]
+)
 @pytest.mark.parametrize("order_type", ["market", "limit", "chase"])
 def test_enabled_okx_bot_initializes_with_each_dca_strategy(
-    default_conf_usdt, mocker, strategy_class, order_type
+    default_conf_usdt, mocker, strategy_name, order_type
 ):
     conf = default_conf_usdt
     conf.update(
         {
-            "strategy": strategy_class.__name__,
+            "strategy": strategy_name,
             "strategy_path": str(Path("user_data/strategies").resolve()),
             "trading_mode": "futures",
             "margin_mode": "cross",
@@ -71,7 +70,7 @@ def test_enabled_okx_bot_initializes_with_each_dca_strategy(
     bot = FreqtradeBot(conf)
     assert bot.hedges.enabled
     assert bot.exchange.net_only is False
-    assert bot.strategy.get_strategy_name() == strategy_class.__name__
+    assert bot.strategy.get_strategy_name() == strategy_name
 
 
 @pytest.mark.parametrize("strategy_class", STRATEGIES)

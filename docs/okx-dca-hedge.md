@@ -113,7 +113,7 @@ values log an error/warning and leave normal exits active. Existing linked group
 are never reevaluated. A committed request freezes the decision even if orders fill
 during cancellation; the reconciled remaining quantity determines the hedge size.
 
-`MarketStructureTrendMatrixStrategy` returns `mstm_stop_before_target` for an ATR
+`FMarketStructureTrendMatrixStrategy` returns `mstm_stop_before_target` for an ATR
 stop touch before any target fill. Any positive target fill counts, including a
 partial fill on a subsequently canceled order; plotted wick hits do not.
 Zero-target mode is eligible too. A simultaneous local exit signal yields to the
@@ -222,6 +222,13 @@ adjustments, ROI exits, exit signals, custom exits, stop-loss, trailing stops an
 automatic exchange stop placement. Existing automatic orders are canceled during
 preparation. This suspension also applies while a hedge is pending or blocked.
 Exchange liquidation and funding charges still apply.
+
+Liquidation warnings remain active when a liquidation price is available. For
+hedge-managed legs, the warning identifies the trades requiring manual closure;
+it does not enable automatic exits. Cross-margin warnings include all open hedge
+legs, even if the closest position to liquidation is outside a hedge group.
+For held isolated legs, check the current liquidation price on OKX after changing
+position margin; managed fills do not refresh the bot's stored liquidation price.
 
 Use the bot's **force-exit on either trade ID** to request a market close of both
 legs. The bot closes each leg's actual remaining amount and persists the closing
@@ -356,13 +363,16 @@ contract conversion and reliable client-ID recovery to be implemented and tested
 
 ## Validation
 
-The 2026-09-16 regression run passed **1,324 tests**, covering persistence, bot
+The 2026-09-30 merge regression run passed **1,446 tests**, covering persistence, bot
 behavior, RPC/Telegram/HTTP API, OKX, wallets, configuration, shared strategy
 callbacks, DCA triggers, and the market-structure strategy. Coverage includes
 complete schema creation on fresh and ordinary existing databases, restart
 recovery, and preventing quantity changes from unexplained wallet discrepancies.
-One unrelated FreqAI API test was excluded because the optional `datasieve`
-dependency was unavailable. Ruff lint and formatting checks passed.
+The FreqAI-model and hyperopt-loss API discovery tests were excluded because
+optional `cloudpickle`/`datasieve` dependencies were unavailable. Repository-wide
+test collection also stopped at the missing `cloudpickle` dependency. After the
+final warning-message adjustment, all 151 Telegram and liquidation-warning tests
+passed. Ruff lint and formatting checks passed.
 
 Exchange transport was mocked; no authenticated demo or live orders were placed.
-The test environment used CCXT 4.5.71, while the repository pins 4.5.76.
+The test environment used CCXT 4.5.71, while the repository pins 4.5.84.

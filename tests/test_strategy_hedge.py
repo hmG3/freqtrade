@@ -1,3 +1,5 @@
+from importlib import import_module
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,13 +14,11 @@ from freqtrade.exceptions import (
 )
 from freqtrade.persistence import Order, Trade
 from freqtrade.persistence.hedge_group import HedgeGroup
+from freqtrade.resolvers.iresolver import PathModifier
 from freqtrade.rpc import RPC
 from freqtrade.strategy import IStrategy
 from tests import test_dca_hedge as hedge_fixtures
 from tests.test_dca_hedge import ccxt_order, fill_exchange, parent_trade
-from user_data.strategies.market_structure_trend_matrix_strategy import (
-    MarketStructureTrendMatrixStrategy,
-)
 
 
 hedge_bot = hedge_fixtures.hedge_bot
@@ -183,7 +183,11 @@ def test_real_trend_matrix_hedge_wins_over_stop_and_opposite_signal(hedge_bot, i
     trade = parent_trade(bot, is_short=is_short)
     trade.enter_tag = "mstm_bearish_choch" if is_short else "mstm_bullish_choch"
     trade.adjust_stop_loss(80, -0.01, allow_refresh=True)
-    bot.strategy = MarketStructureTrendMatrixStrategy(bot.config)
+    with PathModifier(Path(__file__).parents[1] / "user_data/strategies"):
+        strategy_class = import_module(
+            "Fmarket_structure_trend_matrix_strategy"
+        ).FMarketStructureTrendMatrixStrategy
+    bot.strategy = strategy_class(bot.config)
     bot.strategy.dp = bot.dataprovider
     stop = trade.stop_loss
     bot.exchange.get_rate.return_value = stop
